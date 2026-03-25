@@ -38,6 +38,7 @@
 #include "kvm_i386.h"
 #include "../confidential-guest.h"
 #include "sev.h"
+#include "pkvm.h"
 #include "xen-emu.h"
 #include "hyperv.h"
 #include "hyperv-proto.h"
@@ -186,12 +187,19 @@ static KVMMSRHandlers msr_handlers[KVM_MSR_FILTER_MAX_RANGES];
 static RateLimit bus_lock_ratelimit_ctrl;
 static int kvm_get_one_msr(X86CPU *cpu, int index, uint64_t *value);
 
-static const char *vm_type_name[] = {
-    [KVM_X86_DEFAULT_VM] = "default",
-    [KVM_X86_SEV_VM] = "SEV",
-    [KVM_X86_SEV_ES_VM] = "SEV-ES",
-    [KVM_X86_SNP_VM] = "SEV-SNP",
-};
+static const char *kvm_x86_vm_type_name(int type)
+{
+    switch (type) {
+    case KVM_X86_DEFAULT_VM:          return "default";
+    case KVM_X86_SW_PROTECTED_VM:     return "SW-protected";
+    case KVM_X86_SEV_VM:              return "SEV";
+    case KVM_X86_SEV_ES_VM:           return "SEV-ES";
+    case KVM_X86_SNP_VM:              return "SEV-SNP";
+    case KVM_X86_TDX_VM:              return "TDX";
+    case KVM_X86_PKVM_PROTECTED_VM:   return "pKVM";
+    default:                          return "unknown";
+    }
+}
 
 bool kvm_is_vm_type_supported(int type)
 {
@@ -210,6 +218,12 @@ bool kvm_is_vm_type_supported(int type)
     return !!(machine_types & BIT(type));
 }
 
+bool kvm_pkvm_protected_vm_supported(void)
+{
+    return kvm_check_extension(KVM_STATE(current_machine->accelerator),
+                               KVM_CAP_X86_PROTECTED_VM) > 0;
+}
+
 int kvm_get_vm_type(MachineState *ms)
 {
     int kvm_type = KVM_X86_DEFAULT_VM;
@@ -225,7 +239,8 @@ int kvm_get_vm_type(MachineState *ms)
     }
 
     if (!kvm_is_vm_type_supported(kvm_type)) {
-        error_report("vm-type %s not supported by KVM", vm_type_name[kvm_type]);
+        error_report("vm-type %s not supported by KVM",
+                     kvm_x86_vm_type_name(kvm_type));
         exit(1);
     }
 
@@ -2409,6 +2424,15 @@ void kvm_arch_reset_vcpu(X86CPU *cpu)
     kvm_init_nested_state(env);
 
     sev_es_set_reset_vector(CPU(cpu));
+
+    /*
+     * pKVM: configure BSP for 32-bit flat protected mode entry when pVM
+     * firmware is in use.  The kernel sets the firmware entry RIP when it
+     * processes FLAGS_SET_FW_GPA; QEMU must not override it here.
+     */
+    if (pkvm_firmware_enabled() && cpu_is_bsp(cpu)) {
+        pkvm_configure_flat32_segments(env);
+    }
 }
 
 void kvm_arch_after_reset_vcpu(X86CPU *cpu)
