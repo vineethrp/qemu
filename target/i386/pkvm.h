@@ -24,9 +24,9 @@ bool pkvm_firmware_enabled(void);
 
 #define TYPE_PKVM_GUEST "pkvm-guest"
 
-struct CPUX86State;
+typedef struct CPUArchState CPUX86State;
 
-void pkvm_configure_flat32_segments(struct CPUX86State *env);
+void pkvm_configure_flat32_segments(CPUX86State *env);
 
 #endif /* !CONFIG_USER_ONLY */
 

@@ -11,6 +11,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 
 #include <linux/kvm.h>
 #include <sys/ioctl.h>
@@ -19,6 +20,7 @@
 #include "qom/object_interfaces.h"
 #include "qemu/module.h"
 #include "qemu/error-report.h"
+#include "hw/boards.h"
 #include "system/kvm.h"
 #include "kvm/kvm_i386.h"
 #include "pkvm.h"
