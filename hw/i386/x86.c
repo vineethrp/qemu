@@ -37,6 +37,7 @@
 
 #include "hw/nmi.h"
 #include "kvm/kvm_i386.h"
+#include "target/i386/pkvm.h"
 
 
 void init_topo_info(X86CPUTopoInfo *topo_info,
@@ -372,6 +373,37 @@ static void x86_machine_initfn(Object *obj)
     x86ms->above_4g_mem_start = 4 * GiB;
 }
 
+#ifdef CONFIG_PKVM
+static bool x86_machine_get_pkvm(Object *obj, Error **errp)
+{
+    MachineState *ms = MACHINE(obj);
+
+    return ms->cgs && object_dynamic_cast(OBJECT(ms->cgs), TYPE_PKVM_GUEST);
+}
+
+static void x86_machine_set_pkvm(Object *obj, bool value, Error **errp)
+{
+    MachineState *ms = MACHINE(obj);
+    Object *pkvm_obj;
+
+    if (!value) {
+        return;
+    }
+
+    if (ms->cgs) {
+        error_setg(errp, "pkvm: confidential-guest-support already set; "
+                   "do not combine -machine pkvm=on with memory-encryption");
+        return;
+    }
+
+    pkvm_obj = object_new(TYPE_PKVM_GUEST);
+    object_property_add_child(object_get_objects_root(), "pkvm0", pkvm_obj);
+    object_property_set_link(obj, "confidential-guest-support", pkvm_obj,
+                             errp);
+    object_unref(pkvm_obj);
+}
+#endif /* CONFIG_PKVM */
+
 static void x86_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
@@ -440,6 +472,14 @@ static void x86_machine_class_init(ObjectClass *oc, void *data)
         NULL, NULL);
     object_class_property_set_description(oc, "sgx-epc",
         "SGX EPC device");
+
+#ifdef CONFIG_PKVM
+    object_class_property_add_bool(oc, X86_MACHINE_PKVM,
+        x86_machine_get_pkvm, x86_machine_set_pkvm);
+    object_class_property_set_description(oc, X86_MACHINE_PKVM,
+        "Enable pKVM x86 protected VM mode. Equivalent to "
+        "-object pkvm-guest,id=pkvm0 -machine ...,memory-encryption=pkvm0");
+#endif
 }
 
 static const TypeInfo x86_machine_info = {
