@@ -161,7 +161,7 @@ static int pkvm_kvm_init(ConfidentialGuestSupport *cgs, Error **errp)
             error_setg(errp,
                        "pkvm: kernel firmware size %"PRIu64" exceeds "
                        "maximum %"PRIu64,
-                       info.firmware_size, (uint64_t)PKVM_FW_MAX_SIZE);
+                       (uint64_t)info.firmware_size, (uint64_t)PKVM_FW_MAX_SIZE);
             return -EINVAL;
         }
         pkvm->fw_size = info.firmware_size;
