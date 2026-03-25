@@ -924,5 +924,18 @@ struct kvm_hyperv_eventfd {
 #define KVM_X86_SEV_ES_VM	3
 #define KVM_X86_SNP_VM		4
 #define KVM_X86_TDX_VM		5
+#define KVM_X86_PKVM_PROTECTED_VM	28
+
+/*
+ * pKVM protected VM capability (KVM_ENABLE_CAP with .cap = KVM_CAP_X86_PROTECTED_VM).
+ * Uses an out-of-range value to avoid conflicts with upstream capability numbers.
+ */
+#define KVM_CAP_X86_PROTECTED_VM_FLAGS_SET_FW_GPA	0
+#define KVM_CAP_X86_PROTECTED_VM_FLAGS_INFO		1
+
+struct kvm_protected_vm_info {
+	__u64 firmware_size;
+	__u64 __reserved[7];
+};
 
 #endif /* _ASM_X86_KVM_H */
