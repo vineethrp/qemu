@@ -3541,6 +3541,18 @@ static int kvm_put_sregs(X86CPU *cpu)
      */
     memset(sregs.interrupt_bitmap, 0, sizeof(sregs.interrupt_bitmap));
 
+    /*
+     * For pKVM guests, preserve apic_base from the current KVM state so
+     * we do not try to override the hypervisor-managed APIC base address.
+     * This mirrors crosvm's GET-first, then SET pattern.
+     */
+    if (pkvm_enabled()) {
+        if (kvm_vcpu_ioctl(CPU(cpu), KVM_GET_SREGS, &sregs) < 0) {
+            /* On failure just proceed; the SET below may also fail. */
+            memset(&sregs, 0, sizeof(sregs));
+        }
+    }
+
     if ((env->eflags & VM_MASK)) {
         set_v8086_seg(&sregs.cs, &env->segs[R_CS]);
         set_v8086_seg(&sregs.ds, &env->segs[R_DS]);
@@ -5331,8 +5343,13 @@ int kvm_arch_put_registers(CPUState *cpu, int level, Error **errp)
         }
     }
 
-    /* must be before kvm_put_nested_state so that EFER.SVME is set */
-    ret = has_sregs2 ? kvm_put_sregs2(x86_cpu) : kvm_put_sregs(x86_cpu);
+    /*
+     * pKVM does not support KVM_SET_SREGS2 (it rejects PDPTR writes and
+     * certain apic_base updates managed by the hypervisor).  Always use
+     * legacy KVM_SET_SREGS for pKVM guests.
+     */
+    ret = (has_sregs2 && !pkvm_enabled()) ? kvm_put_sregs2(x86_cpu)
+                                          : kvm_put_sregs(x86_cpu);
     if (ret < 0) {
         error_setg_errno(errp, -ret, "Failed to set special registers");
         return ret;
