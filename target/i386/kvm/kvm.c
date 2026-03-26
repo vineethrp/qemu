@@ -3585,7 +3585,17 @@ static int kvm_put_sregs(X86CPU *cpu)
     sregs.cr4 = env->cr[4];
 
     sregs.cr8 = cpu_get_apic_tpr(cpu->apic_state);
-    sregs.apic_base = cpu_get_apic_base(cpu->apic_state);
+    /*
+     * For pKVM guests, apic_base is hypervisor-managed.  kvm_apic_set_base()
+     * in the kernel rejects any value that differs from the current
+     * vcpu->arch.apic_base (unless it is x2APIC mode).  The GET-before-SET
+     * above already filled sregs.apic_base with the kernel's current value;
+     * leave it untouched so the kernel sees an identical value and skips the
+     * mode-change logic.
+     */
+    if (!pkvm_enabled()) {
+        sregs.apic_base = cpu_get_apic_base(cpu->apic_state);
+    }
 
     sregs.efer = env->efer;
 
