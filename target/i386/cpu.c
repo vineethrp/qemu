@@ -35,6 +35,7 @@
 #include "standard-headers/asm-x86/kvm_para.h"
 #include "hw/qdev-properties.h"
 #include "hw/i386/topology.h"
+#include "target/i386/pkvm.h"
 #ifndef CONFIG_USER_ONLY
 #include "system/reset.h"
 #include "qapi/qapi-commands-machine-target.h"
@@ -7861,8 +7862,9 @@ void x86_cpu_expand_features(X86CPU *cpu, Error **errp)
         }
     }
 
-    if (!kvm_enabled() || !cpu->expose_kvm) {
+    if (!kvm_enabled() || !cpu->expose_kvm || pkvm_enabled()) {
         env->features[FEAT_KVM] = 0;
+        env->features[FEAT_KVM_HINTS] = 0;
     }
 
     x86_cpu_enable_xsave_components(cpu);
