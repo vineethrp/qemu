@@ -983,7 +983,29 @@
 #
 # Since: 2.12
 ##
-{ 'struct': 'SevGuestProperties',
+##
+# @PkvmGuestProperties:
+#
+# Properties for pkvm-guest objects.
+#
+# @firmware: if true (default), the pKVM kernel loads its built-in pVM
+#     firmware and the BSP vCPU enters in 32-bit flat protected mode.
+#     If false, the VM is memory-isolated but boots directly without
+#     pVM firmware, useful for testing isolation independently of the
+#     firmware trust chain.
+#
+# @fw-file: optional path to a custom pVM firmware binary to load at
+#     the firmware GPA (0x7FC00000).  Requires firmware to be enabled.
+#
+# Since: 10.0
+##
+{ 'struct': 'PkvmGuestProperties',
+  'if': 'CONFIG_PKVM',
+  'data': { '*firmware': 'bool',
+            '*fw-file':  'str' } }
+
+##
+# @SevGuestProperties:
   'base': 'SevCommonProperties',
   'data': { '*dh-cert-file': 'str',
             '*session-file': 'str',
@@ -1118,6 +1140,8 @@
     { 'name': 'memory-backend-shm',
       'if': 'CONFIG_POSIX' },
     'pef-guest',
+    { 'name': 'pkvm-guest',
+      'if': 'CONFIG_PKVM' },
     { 'name': 'pr-manager-helper',
       'if': 'CONFIG_LINUX' },
     'qtest',
@@ -1192,6 +1216,8 @@
       'memory-backend-ram':         'MemoryBackendProperties',
       'memory-backend-shm':         { 'type': 'MemoryBackendShmProperties',
                                       'if': 'CONFIG_POSIX' },
+      'pkvm-guest':                 { 'type': 'PkvmGuestProperties',
+                                      'if': 'CONFIG_PKVM' },
       'pr-manager-helper':          { 'type': 'PrManagerHelperProperties',
                                       'if': 'CONFIG_LINUX' },
       'qtest':                      'QtestProperties',
