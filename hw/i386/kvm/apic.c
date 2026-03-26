@@ -153,6 +153,9 @@ static void kvm_apic_put(CPUState *cs, run_on_cpu_data data)
 
 static void kvm_apic_post_load(APICCommonState *s)
 {
+    if (kvm_is_guest_state_protected()) {
+        return;
+    }
     run_on_cpu(CPU(s->cpu), kvm_apic_put, RUN_ON_CPU_HOST_PTR(s));
 }
 
@@ -221,6 +224,11 @@ static void kvm_apic_reset(APICCommonState *s)
 {
     /* Not used by KVM, which uses the CPU mp_state instead.  */
     s->wait_for_sipi = 0;
+
+    /* Protected guests own their own APIC state; don't push from QEMU. */
+    if (kvm_is_guest_state_protected()) {
+        return;
+    }
 
     run_on_cpu(CPU(s->cpu), kvm_apic_put, RUN_ON_CPU_HOST_PTR(s));
 }

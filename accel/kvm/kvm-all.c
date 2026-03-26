@@ -2904,7 +2904,9 @@ static void do_kvm_cpu_synchronize_post_reset(CPUState *cpu, run_on_cpu_data arg
 
 void kvm_cpu_synchronize_post_reset(CPUState *cpu)
 {
-    run_on_cpu(cpu, do_kvm_cpu_synchronize_post_reset, RUN_ON_CPU_NULL);
+    if (!kvm_state->guest_state_protected) {
+        run_on_cpu(cpu, do_kvm_cpu_synchronize_post_reset, RUN_ON_CPU_NULL);
+    }
 
     if (cpu == first_cpu) {
         kvm_reset_parked_vcpus(kvm_state);
@@ -2936,6 +2938,13 @@ void kvm_cpu_synchronize_post_init(CPUState *cpu)
          * opportunity to synchronize the state of confidential guests.
          */
         run_on_cpu(cpu, do_kvm_cpu_synchronize_post_init, RUN_ON_CPU_NULL);
+    } else {
+        /*
+         * For protected guests the hypervisor owns all vCPU state; QEMU
+         * must not push anything.  Clear vcpu_dirty so the run loop does
+         * not attempt a KVM_PUT_RUNTIME_STATE before the first entry.
+         */
+        cpu->vcpu_dirty = false;
     }
 }
 
@@ -4422,6 +4431,11 @@ void query_stats_schemas_cb(StatsSchemaList **result, Error **errp)
 void kvm_mark_guest_state_protected(void)
 {
     kvm_state->guest_state_protected = true;
+}
+
+bool kvm_is_guest_state_protected(void)
+{
+    return kvm_state && kvm_state->guest_state_protected;
 }
 
 int kvm_create_guest_memfd(uint64_t size, uint64_t flags, Error **errp)
