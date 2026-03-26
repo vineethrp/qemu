@@ -130,12 +130,6 @@ static int pkvm_kvm_init(ConfidentialGuestSupport *cgs, Error **errp)
     struct kvm_protected_vm_info info = {};
     int ret;
 
-    if (!kvm_pkvm_protected_vm_supported()) {
-        error_setg(errp, "pkvm: KVM_CAP_X86_PROTECTED_VM not supported by "
-                   "host kernel");
-        return -EINVAL;
-    }
-
     if (pkvm->firmware) {
         /*
          * Step 1: query the firmware size embedded in the pKVM kernel module.

@@ -218,11 +218,6 @@ bool kvm_is_vm_type_supported(int type)
     return !!(machine_types & BIT(type));
 }
 
-bool kvm_pkvm_protected_vm_supported(void)
-{
-    return kvm_check_extension(KVM_STATE(current_machine->accelerator),
-                               KVM_CAP_X86_PROTECTED_VM) > 0;
-}
 
 int kvm_get_vm_type(MachineState *ms)
 {
