@@ -57,6 +57,8 @@ uint64_t kvm_swizzle_msi_ext_dest_id(uint64_t address);
 void kvm_update_msi_routes_all(void *private, bool global,
                                uint32_t index, uint32_t mask);
 
+bool kvm_is_pkvm_guest(void);
+
 #endif /* CONFIG_KVM */
 
 void kvm_smm_cpu_address_space_init(X86CPU *cpu);

@@ -153,7 +153,7 @@ static void kvm_apic_put(CPUState *cs, run_on_cpu_data data)
 
 static void kvm_apic_post_load(APICCommonState *s)
 {
-    if (kvm_is_guest_state_protected()) {
+    if (kvm_is_guest_state_protected() || kvm_is_pkvm_guest()) {
         return;
     }
     run_on_cpu(CPU(s->cpu), kvm_apic_put, RUN_ON_CPU_HOST_PTR(s));
@@ -225,8 +225,12 @@ static void kvm_apic_reset(APICCommonState *s)
     /* Not used by KVM, which uses the CPU mp_state instead.  */
     s->wait_for_sipi = 0;
 
-    /* Protected guests own their own APIC state; don't push from QEMU. */
-    if (kvm_is_guest_state_protected()) {
+    /*
+     * Protected guests own their own APIC state; don't push from QEMU.
+     * For pKVM, MSR_IA32_APICBASE is hypervisor-managed and cannot be
+     * written via KVM_SET_MSRS even before first VM entry.
+     */
+    if (kvm_is_guest_state_protected() || kvm_is_pkvm_guest()) {
         return;
     }
 

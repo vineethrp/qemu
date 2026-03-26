@@ -19,9 +19,11 @@
 #include "qapi/error.h"
 #include "qom/object_interfaces.h"
 #include "qemu/module.h"
+#include "qemu/notify.h"
 #include "qemu/error-report.h"
 #include "hw/boards.h"
 #include "system/kvm.h"
+#include "system/system.h"
 #include "kvm/kvm_i386.h"
 #include "pkvm.h"
 #include "confidential-guest.h"
@@ -69,9 +71,28 @@ struct PkvmGuestState {
 
     /* swiotlb: shared DMA bounce buffer for virtio devices. */
     uint64_t swiotlb_size;
+
+    /*
+     * machine_done_notifier: used in firmware=off mode to call
+     * kvm_mark_guest_state_protected() after the initial vCPU state
+     * has been pushed to KVM, preventing the run loop from re-pushing
+     * state that pKVM would reject after first VM entry.
+     */
+    Notifier machine_done_notifier;
 };
 
 static Error *pkvm_mig_blocker;
+
+static void pkvm_machine_done(Notifier *notifier, void *data)
+{
+    /*
+     * firmware=off: initial vCPU state has been pushed to KVM by
+     * kvm_cpu_synchronize_post_init().  Now mark the guest state protected
+     * so QEMU does not attempt to re-push state after the first KVM_RUN,
+     * which pKVM would reject once it sets guest_state_protected on the vCPU.
+     */
+    kvm_mark_guest_state_protected();
+}
 
 bool pkvm_enabled(void)
 {
@@ -189,7 +210,22 @@ static int pkvm_kvm_init(ConfidentialGuestSupport *cgs, Error **errp)
         return ret;
     }
 
-    kvm_mark_guest_state_protected();
+    if (pkvm->firmware) {
+        /*
+         * Firmware mode: the pKVM hypervisor loads firmware and owns all
+         * vCPU state.  QEMU must not push any register state to KVM.
+         */
+        kvm_mark_guest_state_protected();
+    } else {
+        /*
+         * No-firmware mode: QEMU configures the vCPU directly (long-mode
+         * segments, page tables, RIP, etc.) before the first KVM_RUN.
+         * After machine init is done the hypervisor will own state; mark
+         * it protected then so the run loop does not re-push state that
+         * pKVM would reject.
+         */
+        qemu_add_machine_init_done_notifier(&pkvm->machine_done_notifier);
+    }
 
     cgs->ready = true;
     return 0;
@@ -249,6 +285,7 @@ static void pkvm_guest_instance_init(Object *obj)
     pkvm->firmware    = true;
     pkvm->fw_gpa      = PKVM_FW_GPA;
     pkvm->swiotlb_size = PKVM_SWIOTLB_DEFAULT_SIZE;
+    pkvm->machine_done_notifier.notify = pkvm_machine_done;
 }
 
 static void pkvm_guest_instance_finalize(Object *obj)

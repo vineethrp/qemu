@@ -2373,7 +2373,13 @@ int kvm_arch_init_vcpu(CPUState *cs)
         has_msr_tsc_aux = false;
     }
 
-    if (!kvm_state->guest_state_protected) {
+    /*
+     * pKVM blocks writes to hypervisor-managed MSRs (ARCH_CAPABILITIES,
+     * CORE_CAPABILITY, UCODE_REV, VMX MSRs) regardless of guest state
+     * protection status.  Skip kvm_init_msrs entirely for pKVM guests;
+     * the hypervisor initialises these to correct values.
+     */
+    if (!kvm_state->guest_state_protected && !pkvm_enabled()) {
         kvm_init_msrs(cpu);
     }
 
@@ -3675,6 +3681,11 @@ static int kvm_get_one_msr(X86CPU *cpu, int index, uint64_t *value)
     *value = msr_data.entries[0].data;
     return ret;
 }
+bool kvm_is_pkvm_guest(void)
+{
+    return pkvm_enabled();
+}
+
 void kvm_put_apicbase(X86CPU *cpu, uint64_t value)
 {
     int ret;
