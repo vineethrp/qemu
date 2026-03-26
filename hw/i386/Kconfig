@@ -8,6 +8,7 @@ config SEV
 
 config PKVM
     bool
+    default y
     depends on KVM
 
 config SGX
