@@ -2373,7 +2373,9 @@ int kvm_arch_init_vcpu(CPUState *cs)
         has_msr_tsc_aux = false;
     }
 
-    kvm_init_msrs(cpu);
+    if (!kvm_state->guest_state_protected) {
+        kvm_init_msrs(cpu);
+    }
 
     return 0;
 

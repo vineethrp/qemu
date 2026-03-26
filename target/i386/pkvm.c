@@ -189,6 +189,8 @@ static int pkvm_kvm_init(ConfidentialGuestSupport *cgs, Error **errp)
         return ret;
     }
 
+    kvm_mark_guest_state_protected();
+
     cgs->ready = true;
     return 0;
 }
