@@ -973,7 +973,6 @@
 # Since: 10.0
 ##
 { 'struct': 'PkvmGuestProperties',
-  'if': 'CONFIG_PKVM',
   'data': { '*firmware': 'bool',
             '*fw-file':  'str' } }
 
@@ -1139,8 +1138,7 @@
     { 'name': 'memory-backend-shm',
       'if': 'CONFIG_POSIX' },
     'pef-guest',
-    { 'name': 'pkvm-guest',
-      'if': 'CONFIG_PKVM' },
+    'pkvm-guest',
     { 'name': 'pr-manager-helper',
       'if': 'CONFIG_LINUX' },
     'qtest',
@@ -1215,8 +1213,7 @@
       'memory-backend-ram':         'MemoryBackendProperties',
       'memory-backend-shm':         { 'type': 'MemoryBackendShmProperties',
                                       'if': 'CONFIG_POSIX' },
-      'pkvm-guest':                 { 'type': 'PkvmGuestProperties',
-                                      'if': 'CONFIG_PKVM' },
+      'pkvm-guest':                 'PkvmGuestProperties',
       'pr-manager-helper':          { 'type': 'PrManagerHelperProperties',
                                       'if': 'CONFIG_LINUX' },
       'qtest':                      'QtestProperties',
