@@ -3971,6 +3971,18 @@ static int kvm_put_msrs(X86CPU *cpu, int level)
     CPUX86State *env = &cpu->env;
     int i;
 
+    /*
+     * pKVM protected VMs: the hypervisor only allows a small allowlist of
+     * MSR writes from the host for protected vCPUs (MTRRs, MISC_ENABLE, and
+     * a handful of silently-ignored MSRs like STAR/SYSENTER).  All others
+     * return -EPERM.  Since the guest (Linux) initializes its own MSRs on
+     * boot and the pKVM hypervisor manages hypervisor-owned MSRs, skip the
+     * MSR push entirely — matching crosvm's ProtectedWithoutFirmware behaviour.
+     */
+    if (pkvm_enabled()) {
+        return 0;
+    }
+
     kvm_msr_buf_reset(cpu);
 
     kvm_msr_entry_add(cpu, MSR_IA32_SYSENTER_CS, env->sysenter_cs);
