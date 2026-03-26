@@ -5319,7 +5319,11 @@ int kvm_arch_put_registers(CPUState *cpu, int level, Error **errp)
      * root operation upon vCPU reset. kvm_put_msr_feature_control() should also
      * precede kvm_put_nested_state() when 'real' nested state is set.
      */
-    if (level >= KVM_PUT_RESET_STATE) {
+    /*
+     * MSR_IA32_FEATURE_CONTROL is hypervisor-managed for pKVM guests;
+     * skip it to avoid assertion failures.
+     */
+    if (level >= KVM_PUT_RESET_STATE && !pkvm_enabled()) {
         ret = kvm_put_msr_feature_control(x86_cpu);
         if (ret < 0) {
             error_setg_errno(errp, -ret, "Failed to set feature control MSR");
