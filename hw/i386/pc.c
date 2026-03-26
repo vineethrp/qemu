@@ -63,12 +63,15 @@
 #include "e820_memory_layout.h"
 #include "trace.h"
 #include "sev.h"
+#include "target/i386/pkvm.h"
 #include CONFIG_DEVICES
 
 #ifdef CONFIG_XEN_EMU
 #include "hw/xen/xen-legacy-backend.h"
 #include "hw/xen/xen-bus.h"
 #endif
+
+#define X86_PKVM_SHARED_LOW_MEM_SIZE  0x1000
 
 /*
  * Helper for setting model-id for CPU models that changed model-id
@@ -636,6 +639,7 @@ void pc_machine_done(Notifier *notifier, void *data)
                                        &error_abort);
 
     acpi_setup();
+    x86_pkvm_post_acpi_init();
     if (x86ms->fw_cfg) {
         fw_cfg_build_smbios(pcms, x86ms->fw_cfg, pcms->smbios_entry_point_type);
         fw_cfg_add_e820(x86ms->fw_cfg);
@@ -885,11 +889,63 @@ void pc_memory_init(PCMachineState *pcms,
      * Split single memory region and use aliases to address portions of it,
      * done for backwards compatibility with older qemus.
      */
-    ram_below_4g = g_malloc(sizeof(*ram_below_4g));
-    memory_region_init_alias(ram_below_4g, NULL, "ram-below-4g", machine->ram,
-                             0, x86ms->below_4g_mem_size);
-    memory_region_add_subregion(system_memory, 0, ram_below_4g);
-    e820_add_entry(0, x86ms->below_4g_mem_size, E820_RAM);
+    if (pkvm_guest_hole_enabled()) {
+        hwaddr below_before = MIN((hwaddr)x86ms->below_4g_mem_size,
+                                  (hwaddr)PKVM_FW_START);
+        hwaddr below_after_size = x86ms->below_4g_mem_size > PKVM_FW_END ?
+                                  x86ms->below_4g_mem_size - PKVM_FW_END : 0;
+
+        if (below_before) {
+            ram_below_4g = g_malloc(sizeof(*ram_below_4g));
+            memory_region_init_alias(ram_below_4g, NULL, "ram-below-4g",
+                                     machine->ram, 0, below_before);
+            memory_region_add_subregion(system_memory, 0, ram_below_4g);
+            e820_add_entry(0, below_before, E820_RAM);
+        }
+        if (below_after_size) {
+            MemoryRegion *ram_below_4g_after = g_malloc(sizeof(*ram_below_4g_after));
+
+            memory_region_init_alias(ram_below_4g_after, NULL,
+                                     "ram-below-4g-after-pkvm",
+                                     machine->ram, PKVM_FW_START,
+                                     below_after_size);
+            memory_region_add_subregion(system_memory, PKVM_FW_END,
+                                        ram_below_4g_after);
+            e820_add_entry(PKVM_FW_END, below_after_size, E820_RAM);
+        }
+
+        memory_region_init_ram(&x86ms->pkvm_fw_mem, NULL, "pkvm.fw",
+                               PKVM_FW_MAX_SIZE, &error_fatal);
+        memory_region_add_subregion(system_memory, PKVM_FW_START,
+                                    &x86ms->pkvm_fw_mem);
+        e820_add_entry(PKVM_FW_START, PKVM_FW_MAX_SIZE, E820_RESERVED);
+    } else if (pkvm_guest_is_direct_kernel_boot()) {
+        hwaddr shared_low_size = MIN((hwaddr)x86ms->below_4g_mem_size,
+                                     (hwaddr)X86_PKVM_SHARED_LOW_MEM_SIZE);
+        hwaddr private_low_size = x86ms->below_4g_mem_size - shared_low_size;
+
+        if (shared_low_size) {
+            memory_region_init_ram(&x86ms->pkvm_low_mem, NULL, "pkvm.lowmem",
+                                   shared_low_size, &error_fatal);
+            memory_region_add_subregion(system_memory, 0,
+                                        &x86ms->pkvm_low_mem);
+        }
+        if (private_low_size) {
+            ram_below_4g = g_malloc(sizeof(*ram_below_4g));
+            memory_region_init_alias(ram_below_4g, NULL, "ram-below-4g",
+                                     machine->ram, shared_low_size,
+                                     private_low_size);
+            memory_region_add_subregion(system_memory, shared_low_size,
+                                        ram_below_4g);
+        }
+        e820_add_entry(0, x86ms->below_4g_mem_size, E820_RAM);
+    } else {
+        ram_below_4g = g_malloc(sizeof(*ram_below_4g));
+        memory_region_init_alias(ram_below_4g, NULL, "ram-below-4g",
+                                 machine->ram, 0, x86ms->below_4g_mem_size);
+        memory_region_add_subregion(system_memory, 0, ram_below_4g);
+        e820_add_entry(0, x86ms->below_4g_mem_size, E820_RAM);
+    }
     if (x86ms->above_4g_mem_size > 0) {
         ram_above_4g = g_malloc(sizeof(*ram_above_4g));
         memory_region_init_alias(ram_above_4g, NULL, "ram-above-4g",

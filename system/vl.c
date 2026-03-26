@@ -1326,12 +1326,21 @@ static void foreach_device_config_or_exit(int type,
 static void qemu_disable_default_devices(void)
 {
     MachineClass *machine_class = MACHINE_GET_CLASS(current_machine);
+    Object *cgs = current_machine->cgs ? OBJECT(current_machine->cgs) : NULL;
+    bool pkvm_guest =
+        cgs &&
+        g_str_equal(object_get_typename(cgs), "pkvm-guest");
 
     default_driver_check_json();
     qemu_opts_foreach(qemu_find_opts("device"),
                       default_driver_check, NULL, NULL);
     qemu_opts_foreach(qemu_find_opts("global"),
                       default_driver_check, NULL, NULL);
+
+    if (pkvm_guest) {
+        default_vga = 0;
+        default_net = 0;
+    }
 
     if (!vga_model && !default_vga) {
         vga_interface_type = VGA_DEVICE;

@@ -61,6 +61,7 @@
 #include "hw/uefi/var-service-api.h"
 #include "hw/i386/acpi-build.h"
 #include "target/i386/cpu.h"
+#include "target/i386/pkvm.h"
 
 /* ICH9 AHCI has 6 ports */
 #define MAX_SATA_PORTS     6
@@ -190,7 +191,7 @@ static void pc_q35_init(MachineState *machine)
     pc_machine_init_sgx_epc(pcms);
     x86_cpus_init(x86ms, pcmc->default_cpu_version);
 
-    if (kvm_enabled()) {
+    if (kvm_enabled() && !pkvm_enabled()) {
         kvmclock_create(pcmc->kvmclock_create_always);
     }
 

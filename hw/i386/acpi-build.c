@@ -2634,6 +2634,11 @@ void acpi_build(AcpiBuildTables *tables, MachineState *machine)
     g_free(slic_oem.table_id);
 }
 
+void acpi_build_direct(AcpiBuildTables *tables, MachineState *machine)
+{
+    acpi_build(tables, machine);
+}
+
 static void acpi_ram_update(MemoryRegion *mr, GArray *data)
 {
     uint32_t size = acpi_data_len(data);

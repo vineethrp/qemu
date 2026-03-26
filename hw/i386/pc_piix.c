@@ -68,6 +68,7 @@
 #include "hw/uefi/var-service-api.h"
 #include "hw/i386/acpi-build.h"
 #include "target/i386/cpu.h"
+#include "target/i386/pkvm.h"
 
 #define XEN_IOAPIC_NUM_PIRQS 128ULL
 
@@ -184,7 +185,7 @@ static void pc_init1(MachineState *machine, const char *pci_type)
     pc_machine_init_sgx_epc(pcms);
     x86_cpus_init(x86ms, pcmc->default_cpu_version);
 
-    if (kvm_enabled()) {
+    if (kvm_enabled() && !pkvm_enabled()) {
         kvmclock_create(pcmc->kvmclock_create_always);
     }
 

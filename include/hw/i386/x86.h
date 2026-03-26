@@ -59,6 +59,8 @@ struct X86MachineState {
      * in the ROM (-bios) case.
      */
     MemoryRegion bios;
+    MemoryRegion pkvm_fw_mem;
+    MemoryRegion pkvm_low_mem;
 
     /*
      * Map the upper 128 KiB of the BIOS just underneath the 1 MiB address
@@ -134,6 +136,7 @@ void x86_load_linux(X86MachineState *x86ms,
                     FWCfgState *fw_cfg,
                     int acpi_data_size,
                     bool pvh_enabled);
+void x86_pkvm_post_acpi_init(void);
 
 bool x86_machine_is_smm_enabled(const X86MachineState *x86ms);
 bool x86_machine_is_acpi_enabled(const X86MachineState *x86ms);

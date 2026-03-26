@@ -36,6 +36,7 @@
 #include "hw/i386/microvm.h"
 #include "hw/i386/x86.h"
 #include "target/i386/cpu.h"
+#include "target/i386/pkvm.h"
 #include "hw/intc/i8259.h"
 #include "hw/timer/i8254.h"
 #include "hw/rtc/mc146818rtc.h"
@@ -180,7 +181,7 @@ static void microvm_devices_init(MicrovmMachineState *mms)
         x86ms->ioapic2 = ioapic_init_secondary(gsi_state);
     }
 
-    if (kvm_enabled()) {
+    if (kvm_enabled() && !pkvm_enabled()) {
         kvmclock_create(true);
     }
 

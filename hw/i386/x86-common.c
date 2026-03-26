@@ -25,20 +25,30 @@
 #include "qemu/cutils.h"
 #include "qemu/units.h"
 #include "qemu/datadir.h"
+#include "qemu/bswap.h"
 #include "qapi/error.h"
 #include "system/numa.h"
+#include "system/kvm.h"
 #include "system/system.h"
 #include "system/xen.h"
 #include "trace.h"
 
 #include "hw/i386/x86.h"
+#include "hw/i386/acpi-build.h"
+#include "hw/acpi/acpi.h"
+#include "hw/acpi/piix4.h"
 #include "target/i386/cpu.h"
+#include "target/i386/pkvm.h"
+#include "hw/pci/pci.h"
 #include "hw/rtc/mc146818rtc.h"
 #include "target/i386/sev.h"
 
 #include "hw/acpi/cpu_hotplug.h"
+#include "hw/acpi/vmgenid.h"
 #include "hw/irq.h"
 #include "hw/loader.h"
+#include "hw/southbridge/ich9.h"
+#include "e820_memory_layout.h"
 #include "multiboot.h"
 #include "elf.h"
 #include "standard-headers/asm-x86/bootparam.h"
@@ -52,6 +62,755 @@
 
 /* Physical Address of PVH entry point read from kernel ELF NOTE */
 static size_t pvh_start_addr;
+static const hwaddr x86_pkvm_zero_page_addr = 0x7000;
+static const hwaddr x86_pkvm_boot_stack_pointer = 0x8000;
+static const hwaddr x86_pkvm_acpi_rsdp_addr = 0x00030000;
+static const hwaddr x86_pkvm_acpi_tables_addr = 0x00031000;
+static const hwaddr x86_pkvm_shared_low_mem_size = 0x00100000;
+
+#define X86_PKVM_ACPI_TABLES_MAX_SIZE         0x20000
+#define X86_PKVM_ICH9_PMBASE                  0xb000
+#define X86_PKVM_ACPI_RESERVED_START          x86_pkvm_acpi_rsdp_addr
+#define X86_PKVM_ACPI_RESERVED_END            (x86_pkvm_acpi_tables_addr + \
+                                               X86_PKVM_ACPI_TABLES_MAX_SIZE - 1)
+#define X86_PKVM_BOOTPARAM_ACPI_RSDP_ADDR_OFFSET 0x070
+#define X86_PKVM_BOOTPARAM_E820_COUNT_OFFSET   0x1e8
+#define X86_PKVM_BOOTPARAM_SENTINEL_OFFSET     0x1ef
+#define X86_PKVM_BOOTPARAM_HDR_OFFSET          0x1f1
+#define X86_PKVM_BOOTPARAM_E820_TABLE_OFFSET   0x2d0
+#define X86_PKVM_E820_MAX_ENTRIES              128
+#define X86_PKVM_ACPI_SIG_LEN                  4
+#define X86_PKVM_ACPI_TABLE_HEADER_LEN         36
+#define X86_PKVM_ACPI_HEADER_LENGTH_OFFSET     4
+#define X86_PKVM_ACPI_HEADER_CHECKSUM_OFFSET   9
+
+#define X86_PKVM_FADT_FIELD_FACS_ADDR32           36
+#define X86_PKVM_FADT_FIELD_DSDT_ADDR32           40
+#define X86_PKVM_FADT_FIELD_SCI_INTERRUPT         46
+#define X86_PKVM_FADT_FIELD_SMI_COMMAND           48
+#define X86_PKVM_FADT_FIELD_ACPI_ENABLE           52
+#define X86_PKVM_FADT_FIELD_ACPI_DISABLE          53
+#define X86_PKVM_FADT_FIELD_PM1A_EVENT_BLK_ADDR   56
+#define X86_PKVM_FADT_FIELD_PM1B_EVENT_BLK_ADDR   60
+#define X86_PKVM_FADT_FIELD_PM1A_CONTROL_BLK_ADDR 64
+#define X86_PKVM_FADT_FIELD_PM1B_CONTROL_BLK_ADDR 68
+#define X86_PKVM_FADT_FIELD_PM2_CONTROL_BLK_ADDR  72
+#define X86_PKVM_FADT_FIELD_PM_TMR_BLK_ADDR       76
+#define X86_PKVM_FADT_FIELD_GPE0_BLK_ADDR         80
+#define X86_PKVM_FADT_FIELD_GPE1_BLK_ADDR         84
+#define X86_PKVM_FADT_FIELD_PM1A_EVENT_BLK_LEN    88
+#define X86_PKVM_FADT_FIELD_PM1A_CONTROL_BLK_LEN  89
+#define X86_PKVM_FADT_FIELD_PM2_CONTROL_BLK_LEN   90
+#define X86_PKVM_FADT_FIELD_PM_TMR_LEN            91
+#define X86_PKVM_FADT_FIELD_GPE0_BLK_LEN          92
+#define X86_PKVM_FADT_FIELD_GPE1_BLK_LEN          93
+#define X86_PKVM_FADT_FIELD_FACS_ADDR64           132
+#define X86_PKVM_FADT_FIELD_DSDT_ADDR64           140
+#define X86_PKVM_FADT_FIELD_X_PM1A_EVENT_BLK_ADDR 148
+#define X86_PKVM_FADT_FIELD_X_PM1B_EVENT_BLK_ADDR 160
+#define X86_PKVM_FADT_FIELD_X_PM1A_CONTROL_BLK_ADDR 172
+#define X86_PKVM_FADT_FIELD_X_PM1B_CONTROL_BLK_ADDR 184
+#define X86_PKVM_FADT_FIELD_X_PM2_CONTROL_BLK_ADDR 196
+#define X86_PKVM_FADT_FIELD_X_PM_TMR_BLK_ADDR      208
+#define X86_PKVM_FADT_FIELD_X_GPE0_BLK_ADDR        220
+#define X86_PKVM_FADT_FIELD_X_GPE1_BLK_ADDR        232
+#define X86_PKVM_ACPI_GAS_SIZE                     12
+
+struct x86_pkvm_setup_header {
+    uint8_t setup_sects;
+    uint16_t root_flags;
+    uint32_t syssize;
+    uint16_t ram_size;
+    uint16_t vid_mode;
+    uint16_t root_dev;
+    uint16_t boot_flag;
+    uint16_t jump;
+    uint32_t header;
+    uint16_t version;
+    uint32_t realmode_swtch;
+    uint16_t start_sys_seg;
+    uint16_t kernel_version;
+    uint8_t type_of_loader;
+    uint8_t loadflags;
+    uint16_t setup_move_size;
+    uint32_t code32_start;
+    uint32_t ramdisk_image;
+    uint32_t ramdisk_size;
+    uint32_t bootsect_kludge;
+    uint16_t heap_end_ptr;
+    uint8_t ext_loader_ver;
+    uint8_t ext_loader_type;
+    uint32_t cmd_line_ptr;
+    uint32_t initrd_addr_max;
+    uint32_t kernel_alignment;
+    uint8_t relocatable_kernel;
+    uint8_t min_alignment;
+    uint16_t xloadflags;
+    uint32_t cmdline_size;
+    uint32_t hardware_subarch;
+    uint64_t hardware_subarch_data;
+    uint32_t payload_offset;
+    uint32_t payload_length;
+    uint64_t setup_data;
+    uint64_t pref_address;
+    uint32_t init_size;
+    uint32_t handover_offset;
+    uint32_t kernel_info_offset;
+} QEMU_PACKED;
+
+struct x86_pkvm_bios_linker_loader_entry {
+    uint32_t command;
+    union {
+        struct {
+            char file[56];
+            uint32_t align;
+            uint8_t zone;
+        } alloc;
+        struct {
+            char dest_file[56];
+            char src_file[56];
+            uint32_t offset;
+            uint8_t size;
+        } pointer;
+        struct {
+            char file[56];
+            uint32_t offset;
+            uint32_t start;
+            uint32_t length;
+        } cksum;
+        struct {
+            char dest_file[56];
+            char src_file[56];
+            uint32_t dst_offset;
+            uint32_t src_offset;
+            uint8_t size;
+        } wr_pointer;
+        char pad[124];
+    };
+} QEMU_PACKED;
+
+enum {
+    X86_PKVM_BIOS_LINKER_LOADER_COMMAND_ALLOCATE = 0x1,
+    X86_PKVM_BIOS_LINKER_LOADER_COMMAND_ADD_POINTER = 0x2,
+    X86_PKVM_BIOS_LINKER_LOADER_COMMAND_ADD_CHECKSUM = 0x3,
+    X86_PKVM_BIOS_LINKER_LOADER_COMMAND_WRITE_POINTER = 0x4,
+};
+
+typedef struct X86PkvmAcpiFile {
+    const char *name;
+    uint8_t *blob;
+    size_t len;
+    hwaddr addr;
+} X86PkvmAcpiFile;
+
+typedef struct X86PkvmAcpiPmInfo {
+    uint32_t pm_io_base;
+    uint32_t gpe0_blk;
+    uint8_t gpe0_blk_len;
+    uint16_t sci_int;
+} X86PkvmAcpiPmInfo;
+
+#define X86_PKVM_ACPI_HW_ERROR_FW_CFG_FILE "etc/hardware_errors"
+
+static X86PkvmAcpiFile *x86_pkvm_acpi_find_file(X86PkvmAcpiFile *files,
+                                                size_t nr_files,
+                                                const char *name)
+{
+    size_t i;
+
+    for (i = 0; i < nr_files; i++) {
+        if (!strcmp(files[i].name, name)) {
+            return &files[i];
+        }
+    }
+
+    return NULL;
+}
+
+static void x86_pkvm_acpi_update_checksum(uint8_t *blob, size_t len)
+{
+    uint8_t sum = 0;
+    size_t i;
+
+    if (len <= X86_PKVM_ACPI_HEADER_CHECKSUM_OFFSET) {
+        return;
+    }
+
+    blob[X86_PKVM_ACPI_HEADER_CHECKSUM_OFFSET] = 0;
+    for (i = 0; i < len; i++) {
+        sum += blob[i];
+    }
+    blob[X86_PKVM_ACPI_HEADER_CHECKSUM_OFFSET] = (uint8_t)(0 - sum);
+}
+
+static uint8_t *x86_pkvm_acpi_find_table(uint8_t *blob, size_t blob_len,
+                                         const char *signature, uint32_t *len)
+{
+    size_t offset = 0;
+
+    while (offset + X86_PKVM_ACPI_TABLE_HEADER_LEN <= blob_len) {
+        uint8_t *table = blob + offset;
+        uint32_t table_len = ldl_le_p(table + X86_PKVM_ACPI_HEADER_LENGTH_OFFSET);
+
+        if (table_len < X86_PKVM_ACPI_TABLE_HEADER_LEN ||
+            offset + table_len > blob_len) {
+            return NULL;
+        }
+        if (!memcmp(table, signature, X86_PKVM_ACPI_SIG_LEN)) {
+            *len = table_len;
+            return table;
+        }
+
+        offset += table_len;
+    }
+
+    return NULL;
+}
+
+static bool x86_pkvm_acpi_get_pm_info(X86PkvmAcpiPmInfo *pm)
+{
+    Object *pmdev = object_resolve_type_unambiguous(TYPE_PIIX4_PM, NULL);
+
+    if (!pmdev) {
+        pmdev = object_resolve_type_unambiguous(TYPE_ICH9_LPC_DEVICE, NULL);
+    }
+    if (!pmdev) {
+        return false;
+    }
+
+    pm->pm_io_base = object_property_get_uint(pmdev, ACPI_PM_PROP_PM_IO_BASE, NULL);
+    pm->gpe0_blk = object_property_get_uint(pmdev, ACPI_PM_PROP_GPE0_BLK, NULL);
+    pm->gpe0_blk_len = object_property_get_uint(pmdev, ACPI_PM_PROP_GPE0_BLK_LEN,
+                                                NULL);
+    pm->sci_int = object_property_get_uint(pmdev, ACPI_PM_PROP_SCI_INT, NULL);
+    return true;
+}
+
+static void x86_pkvm_configure_ich9_lpc_pm_base(void)
+{
+    Object *obj = object_resolve_type_unambiguous(TYPE_ICH9_LPC_DEVICE, NULL);
+    PCIDevice *pdev;
+    PCIDeviceClass *pc;
+
+    if (!obj) {
+        return;
+    }
+
+    pdev = PCI_DEVICE(obj);
+    pc = PCI_DEVICE_GET_CLASS(pdev);
+    pc->config_write(pdev, ICH9_LPC_PMBASE,
+                     X86_PKVM_ICH9_PMBASE | ICH9_LPC_PMBASE_RTE, 4);
+    pc->config_write(pdev, ICH9_LPC_ACPI_CTRL,
+                     ICH9_LPC_ACPI_CTRL_ACPI_EN | ICH9_LPC_ACPI_CTRL_9, 1);
+}
+
+static void x86_pkvm_acpi_override_fadt(X86PkvmAcpiFile *tables_file)
+{
+    X86PkvmAcpiPmInfo pm;
+    uint8_t *fadt;
+    uint8_t *facs;
+    uint8_t *dsdt;
+    uint32_t fadt_len;
+    uint32_t facs_len;
+    uint32_t dsdt_len;
+    uint64_t facs_addr;
+    uint64_t dsdt_addr;
+
+    if (!x86_pkvm_acpi_get_pm_info(&pm)) {
+        error_report("pkvm direct boot could not resolve ACPI PM device");
+        exit(1);
+    }
+
+    fadt = x86_pkvm_acpi_find_table(tables_file->blob, tables_file->len, "FACP",
+                                    &fadt_len);
+    if (!fadt) {
+        error_report("pkvm direct boot could not locate FADT");
+        exit(1);
+    }
+
+    facs = x86_pkvm_acpi_find_table(tables_file->blob, tables_file->len, "FACS",
+                                    &facs_len);
+    dsdt = x86_pkvm_acpi_find_table(tables_file->blob, tables_file->len, "DSDT",
+                                    &dsdt_len);
+    if (!facs || !dsdt) {
+        error_report("pkvm direct boot could not locate FACS/DSDT");
+        exit(1);
+    }
+    facs_addr = tables_file->addr + (facs - tables_file->blob);
+    dsdt_addr = tables_file->addr + (dsdt - tables_file->blob);
+
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_FACS_ADDR32, 0);
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_DSDT_ADDR32, 0);
+    stw_le_p(fadt + X86_PKVM_FADT_FIELD_SCI_INTERRUPT, pm.sci_int);
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_SMI_COMMAND, 0);
+    fadt[X86_PKVM_FADT_FIELD_ACPI_ENABLE] = 0;
+    fadt[X86_PKVM_FADT_FIELD_ACPI_DISABLE] = 0;
+
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_PM1A_EVENT_BLK_ADDR, pm.pm_io_base);
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_PM1B_EVENT_BLK_ADDR, 0);
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_PM1A_CONTROL_BLK_ADDR, pm.pm_io_base + 4);
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_PM1B_CONTROL_BLK_ADDR, 0);
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_PM2_CONTROL_BLK_ADDR, 0);
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_PM_TMR_BLK_ADDR, 0);
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_GPE0_BLK_ADDR, 0);
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_GPE1_BLK_ADDR, 0);
+
+    fadt[X86_PKVM_FADT_FIELD_PM1A_EVENT_BLK_LEN] = 4;
+    fadt[X86_PKVM_FADT_FIELD_PM1A_CONTROL_BLK_LEN] = 2;
+    fadt[X86_PKVM_FADT_FIELD_PM2_CONTROL_BLK_LEN] = 0;
+    fadt[X86_PKVM_FADT_FIELD_PM_TMR_LEN] = 0;
+    fadt[X86_PKVM_FADT_FIELD_GPE0_BLK_LEN] = 0;
+    fadt[X86_PKVM_FADT_FIELD_GPE1_BLK_LEN] = 0;
+
+    stq_le_p(fadt + X86_PKVM_FADT_FIELD_FACS_ADDR64, facs_addr);
+    stq_le_p(fadt + X86_PKVM_FADT_FIELD_DSDT_ADDR64, dsdt_addr);
+
+    memset(fadt + X86_PKVM_FADT_FIELD_X_PM1B_EVENT_BLK_ADDR, 0,
+           X86_PKVM_ACPI_GAS_SIZE);
+    memset(fadt + X86_PKVM_FADT_FIELD_X_PM1A_EVENT_BLK_ADDR, 0,
+           X86_PKVM_ACPI_GAS_SIZE);
+    memset(fadt + X86_PKVM_FADT_FIELD_X_PM1B_CONTROL_BLK_ADDR, 0,
+           X86_PKVM_ACPI_GAS_SIZE);
+    memset(fadt + X86_PKVM_FADT_FIELD_X_PM1A_CONTROL_BLK_ADDR, 0,
+           X86_PKVM_ACPI_GAS_SIZE);
+    memset(fadt + X86_PKVM_FADT_FIELD_X_PM2_CONTROL_BLK_ADDR, 0,
+           X86_PKVM_ACPI_GAS_SIZE);
+    memset(fadt + X86_PKVM_FADT_FIELD_X_PM_TMR_BLK_ADDR, 0,
+           X86_PKVM_ACPI_GAS_SIZE);
+    memset(fadt + X86_PKVM_FADT_FIELD_X_GPE0_BLK_ADDR, 0,
+           X86_PKVM_ACPI_GAS_SIZE);
+    memset(fadt + X86_PKVM_FADT_FIELD_X_GPE1_BLK_ADDR, 0,
+           X86_PKVM_ACPI_GAS_SIZE);
+
+    x86_pkvm_acpi_update_checksum(fadt, fadt_len);
+}
+
+static bool x86_pkvm_acpi_patch_pointer(uint8_t *blob, size_t blob_len,
+                                        uint32_t offset, uint8_t size,
+                                        hwaddr value)
+{
+    uint64_t le_value = cpu_to_le64(value);
+
+    if (offset + size > blob_len) {
+        return false;
+    }
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        return false;
+    }
+
+    memcpy(blob + offset, &le_value, size);
+    return true;
+}
+
+static bool x86_pkvm_acpi_get_addend(uint8_t *blob, size_t blob_len,
+                                     uint32_t offset, uint8_t size,
+                                     uint64_t *addend)
+{
+    uint16_t value16;
+    uint32_t value32;
+    uint64_t value64;
+
+    if (offset + size > blob_len) {
+        return false;
+    }
+    if (size != 1 && size != 2 && size != 4 && size != 8) {
+        return false;
+    }
+
+    switch (size) {
+    case 1:
+        *addend = blob[offset];
+        break;
+    case 2:
+        memcpy(&value16, blob + offset, sizeof(value16));
+        *addend = le16_to_cpu(value16);
+        break;
+    case 4:
+        memcpy(&value32, blob + offset, sizeof(value32));
+        *addend = le32_to_cpu(value32);
+        break;
+    case 8:
+        memcpy(&value64, blob + offset, sizeof(value64));
+        *addend = le64_to_cpu(value64);
+        break;
+    default:
+        return false;
+    }
+
+    return true;
+}
+
+static bool x86_pkvm_acpi_apply_linker(GArray *cmd_blob, X86PkvmAcpiFile *files,
+                                       size_t nr_files)
+{
+    size_t i;
+    hwaddr next_addr = QEMU_ALIGN_UP(x86_pkvm_acpi_tables_addr +
+                                     files[0].len, 0x1000);
+
+    if (cmd_blob->len % sizeof(struct x86_pkvm_bios_linker_loader_entry)) {
+        return false;
+    }
+
+    for (i = 0; i < cmd_blob->len;
+         i += sizeof(struct x86_pkvm_bios_linker_loader_entry)) {
+        struct x86_pkvm_bios_linker_loader_entry entry;
+        uint32_t command;
+
+        memcpy(&entry, cmd_blob->data + i, sizeof(entry));
+        command = le32_to_cpu(entry.command);
+
+        switch (command) {
+        case 0:
+            break;
+        case X86_PKVM_BIOS_LINKER_LOADER_COMMAND_ALLOCATE:
+        {
+            X86PkvmAcpiFile *file = x86_pkvm_acpi_find_file(files, nr_files,
+                                                            entry.alloc.file);
+            uint32_t align = le32_to_cpu(entry.alloc.align);
+
+            if (!file || !file->blob) {
+                error_report("pkvm acpi unsupported alloc file '%s'",
+                             entry.alloc.file);
+                return false;
+            }
+
+            if (file->addr) {
+                break;
+            }
+
+            next_addr = QEMU_ALIGN_UP(next_addr, MAX(align, 1u));
+            if (next_addr < x86_pkvm_acpi_tables_addr ||
+                next_addr + file->len <
+                x86_pkvm_acpi_tables_addr + files[0].len ||
+                next_addr + file->len >
+                x86_pkvm_acpi_tables_addr + X86_PKVM_ACPI_TABLES_MAX_SIZE) {
+                error_report("pkvm acpi allocation overflow for '%s'",
+                             entry.alloc.file);
+                return false;
+            }
+
+            file->addr = next_addr;
+            next_addr += file->len;
+            break;
+        }
+        case X86_PKVM_BIOS_LINKER_LOADER_COMMAND_ADD_POINTER:
+        {
+            X86PkvmAcpiFile *dest_file;
+            X86PkvmAcpiFile *src_file;
+            uint32_t offset;
+            uint64_t addend;
+
+            dest_file = x86_pkvm_acpi_find_file(files, nr_files,
+                                                entry.pointer.dest_file);
+            src_file = x86_pkvm_acpi_find_file(files, nr_files,
+                                               entry.pointer.src_file);
+            if (!dest_file || !src_file || !dest_file->blob || !src_file->blob ||
+                !dest_file->addr || !src_file->addr) {
+                error_report("pkvm acpi unsupported pointer dest='%s' src='%s'",
+                             entry.pointer.dest_file, entry.pointer.src_file);
+                return false;
+            }
+
+            offset = le32_to_cpu(entry.pointer.offset);
+            if (!x86_pkvm_acpi_get_addend(dest_file->blob, dest_file->len, offset,
+                                          entry.pointer.size, &addend)) {
+                return false;
+            }
+            if (addend >= src_file->len) {
+                return false;
+            }
+            if (!x86_pkvm_acpi_patch_pointer(dest_file->blob, dest_file->len,
+                                             offset,
+                                             entry.pointer.size,
+                                             src_file->addr + addend)) {
+                return false;
+            }
+            break;
+        }
+        case X86_PKVM_BIOS_LINKER_LOADER_COMMAND_ADD_CHECKSUM:
+        {
+            X86PkvmAcpiFile *file;
+            uint32_t start, offset, length;
+            uint8_t sum = 0;
+            size_t j;
+
+            file = x86_pkvm_acpi_find_file(files, nr_files, entry.cksum.file);
+            if (!file || !file->blob || !file->addr) {
+                error_report("pkvm acpi unsupported checksum file '%s'",
+                             entry.cksum.file);
+                return false;
+            }
+
+            start = le32_to_cpu(entry.cksum.start);
+            offset = le32_to_cpu(entry.cksum.offset);
+            length = le32_to_cpu(entry.cksum.length);
+            if (start + length > file->len || offset >= file->len ||
+                offset < start || offset >= start + length) {
+                return false;
+            }
+
+            file->blob[offset] = 0;
+            for (j = start; j < start + length; j++) {
+                sum = sum - file->blob[j];
+            }
+            file->blob[offset] = sum;
+            break;
+        }
+        case X86_PKVM_BIOS_LINKER_LOADER_COMMAND_WRITE_POINTER:
+            break;
+        default:
+            error_report("pkvm acpi unsupported linker command 0x%x", command);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void x86_pkvm_write_acpi_tables(void)
+{
+    MachineState *machine = MACHINE(qdev_get_machine());
+    AcpiBuildTables tables;
+    uint8_t *table_blob;
+    uint8_t *rsdp_blob;
+    X86PkvmAcpiFile files[] = {
+        { ACPI_BUILD_TABLE_FILE, NULL, 0, 0 },
+        { ACPI_BUILD_RSDP_FILE, NULL, 0, x86_pkvm_acpi_rsdp_addr },
+        { ACPI_BUILD_TPMLOG_FILE, NULL, 0, 0 },
+        { VMGENID_GUID_FW_CFG_FILE, NULL, 0, 0 },
+        { X86_PKVM_ACPI_HW_ERROR_FW_CFG_FILE, NULL, 0, 0 },
+    };
+    uint64_t rsdp_addr = cpu_to_le64(x86_pkvm_acpi_rsdp_addr);
+    size_t table_len, rsdp_len;
+    size_t i;
+
+    x86_pkvm_configure_ich9_lpc_pm_base();
+    acpi_build_tables_init(&tables);
+    acpi_build_direct(&tables, machine);
+
+    table_len = acpi_data_len(tables.table_data);
+    rsdp_len = acpi_data_len(tables.rsdp);
+    if (table_len > X86_PKVM_ACPI_TABLES_MAX_SIZE ||
+        x86_pkvm_acpi_rsdp_addr + rsdp_len > x86_pkvm_acpi_tables_addr) {
+        error_report("pkvm direct boot ACPI table placement is invalid");
+        exit(1);
+    }
+
+    table_blob = g_memdup2(tables.table_data->data, table_len);
+    rsdp_blob = g_memdup2(tables.rsdp->data, rsdp_len);
+    files[0].blob = table_blob;
+    files[0].len = table_len;
+    files[0].addr = x86_pkvm_acpi_tables_addr;
+    files[1].blob = rsdp_blob;
+    files[1].len = rsdp_len;
+    if (tables.tcpalog && acpi_data_len(tables.tcpalog)) {
+        files[2].blob = g_memdup2(tables.tcpalog->data,
+                                  acpi_data_len(tables.tcpalog));
+        files[2].len = acpi_data_len(tables.tcpalog);
+    }
+    if (tables.vmgenid && acpi_data_len(tables.vmgenid)) {
+        files[3].blob = g_memdup2(tables.vmgenid->data,
+                                  acpi_data_len(tables.vmgenid));
+        files[3].len = acpi_data_len(tables.vmgenid);
+    }
+    if (tables.hardware_errors && acpi_data_len(tables.hardware_errors)) {
+        files[4].blob = g_memdup2(tables.hardware_errors->data,
+                                  acpi_data_len(tables.hardware_errors));
+        files[4].len = acpi_data_len(tables.hardware_errors);
+    }
+
+    if (!x86_pkvm_acpi_apply_linker(tables.linker->cmd_blob, files,
+                                    ARRAY_SIZE(files))) {
+        error_report("pkvm direct boot ACPI linker contains unsupported commands");
+        exit(1);
+    }
+    x86_pkvm_acpi_override_fadt(&files[0]);
+
+    for (i = 0; i < ARRAY_SIZE(files); i++) {
+        if (files[i].blob && files[i].addr) {
+            cpu_physical_memory_write(files[i].addr, files[i].blob, files[i].len);
+        }
+    }
+    cpu_physical_memory_write(x86_pkvm_zero_page_addr +
+                              X86_PKVM_BOOTPARAM_ACPI_RSDP_ADDR_OFFSET,
+                              &rsdp_addr, sizeof(rsdp_addr));
+
+    for (i = 0; i < ARRAY_SIZE(files); i++) {
+        g_free(files[i].blob);
+    }
+    acpi_build_tables_cleanup(&tables, true);
+}
+
+void x86_pkvm_post_acpi_init(void)
+{
+    if (!pkvm_enabled() || pkvm_guest_uses_firmware()) {
+        return;
+    }
+
+    x86_pkvm_write_acpi_tables();
+
+    if (kvm_enabled() &&
+        kvm_set_memory_attributes_shared(0, x86_pkvm_shared_low_mem_size)) {
+        error_report("pKVM direct boot failed to share the guest low memory");
+        exit(1);
+    }
+}
+
+static uint64_t x86_pkvm_gdt_entry(uint16_t flags, uint32_t base, uint32_t limit)
+{
+    return (((uint64_t)base & 0xff000000ULL) << (56 - 24)) |
+           (((uint64_t)flags & 0x0000f0ffULL) << 40) |
+           (((uint64_t)limit & 0x000f0000ULL) << (48 - 16)) |
+           (((uint64_t)base & 0x00ffffffULL) << 16) |
+           ((uint64_t)limit & 0x0000ffffULL);
+}
+
+static void x86_pkvm_write_gdt(bool is_64bit)
+{
+    uint64_t gdt[6] = {
+        0,
+        0,
+        x86_pkvm_gdt_entry(is_64bit ? 0xa09b : 0xc09b, 0, 0xfffff),
+        x86_pkvm_gdt_entry(0xc093, 0, 0xfffff),
+        x86_pkvm_gdt_entry(0x808b, 0, 0xfffff),
+        0,
+    };
+    size_t size = (is_64bit ? 6 : 5) * sizeof(gdt[0]);
+    uint64_t idt = 0;
+
+    cpu_physical_memory_write(PKVM_BOOT_GDT_ADDR, gdt, size);
+    cpu_physical_memory_write(PKVM_BOOT_IDT_ADDR, &idt, sizeof(idt));
+}
+
+static void x86_pkvm_write_page_tables(void)
+{
+    uint64_t pml4[512] = {};
+    uint64_t pdpte[512] = {};
+    uint64_t pde[512];
+    int i, j;
+
+    pml4[0] = PKVM_BOOT_PDPTE_ADDR | 0x3;
+    cpu_physical_memory_write(PKVM_BOOT_PML4_ADDR, pml4, sizeof(pml4));
+
+    for (i = 0; i < 4; i++) {
+        pdpte[i] = (PKVM_BOOT_PDE_ADDR + i * 0x1000) | 0x3;
+
+        for (j = 0; j < 512; j++) {
+            pde[j] = ((uint64_t)i << 30) | ((uint64_t)j << 21) | 0x83;
+        }
+        cpu_physical_memory_write(PKVM_BOOT_PDE_ADDR + i * 0x1000,
+                                  pde, sizeof(pde));
+    }
+
+    cpu_physical_memory_write(PKVM_BOOT_PDPTE_ADDR, pdpte, sizeof(pdpte));
+}
+
+static void x86_pkvm_populate_e820(uint8_t *zero_page)
+{
+    struct e820_entry *table;
+    int entries, i;
+
+    entries = e820_get_table(&table);
+    if (entries > X86_PKVM_E820_MAX_ENTRIES) {
+        entries = X86_PKVM_E820_MAX_ENTRIES;
+    }
+
+    for (i = 0; i < entries; i++) {
+        struct boot_e820_entry *entry =
+            (struct boot_e820_entry *)(zero_page +
+                                       X86_PKVM_BOOTPARAM_E820_TABLE_OFFSET +
+                                       i * sizeof(struct boot_e820_entry));
+
+        entry->addr = table[i].address;
+        entry->size = table[i].length;
+        entry->type = table[i].type;
+    }
+
+    if (pkvm_guest_is_direct_kernel_boot() &&
+        entries < X86_PKVM_E820_MAX_ENTRIES) {
+        struct boot_e820_entry *entry =
+            (struct boot_e820_entry *)(zero_page +
+                                       X86_PKVM_BOOTPARAM_E820_TABLE_OFFSET +
+                                       entries * sizeof(struct boot_e820_entry));
+
+        entry->addr = X86_PKVM_ACPI_RESERVED_START;
+        entry->size = X86_PKVM_ACPI_RESERVED_END -
+                      X86_PKVM_ACPI_RESERVED_START + 1;
+        entry->type = E820_RESERVED;
+        entries++;
+    }
+
+    zero_page[X86_PKVM_BOOTPARAM_E820_COUNT_OFFSET] = entries;
+}
+
+static hwaddr x86_pkvm_initrd_addr(uint32_t initrd_max, uint64_t initrd_size)
+{
+    hwaddr addr = (initrd_max - initrd_size) & ~4095ULL;
+
+    if (addr < PKVM_FW_END && addr + initrd_size > PKVM_FW_START) {
+        if (initrd_size > PKVM_FW_START) {
+            return HWADDR_MAX;
+        }
+        addr = (PKVM_FW_START - initrd_size) & ~4095ULL;
+    }
+
+    return addr;
+}
+
+static void x86_load_linux_pkvm(X86MachineState *x86ms,
+                                int setup_size,
+                                uint8_t *setup,
+                                int kernel_size,
+                                uint8_t *kernel,
+                                hwaddr cmdline_addr,
+                                hwaddr initrd_addr,
+                                uint64_t initrd_size,
+                                hwaddr kernel_entry,
+                                hwaddr dtb_addr,
+                                bool is_64bit)
+{
+    MachineState *machine = MACHINE(x86ms);
+    uint8_t zero_page[4096] = {};
+    struct x86_pkvm_setup_header *hdr;
+    hwaddr kernel_load_addr = PKVM_BZIMAGE_LOAD_ADDR - setup_size;
+    Error *local_err = NULL;
+
+    memcpy(zero_page, setup, MIN(sizeof(zero_page), (size_t)setup_size));
+    hdr = (struct x86_pkvm_setup_header *)(zero_page + X86_PKVM_BOOTPARAM_HDR_OFFSET);
+    hdr->type_of_loader = 0xff;
+    hdr->boot_flag = 0xaa55;
+    hdr->header = 0x53726448;
+    hdr->cmd_line_ptr = cmdline_addr;
+    hdr->kernel_alignment = 0x1000000;
+    zero_page[X86_PKVM_BOOTPARAM_SENTINEL_OFFSET] = 0;
+    if (initrd_size) {
+        hdr->ramdisk_image = initrd_addr;
+        hdr->ramdisk_size = initrd_size;
+    }
+
+    x86_pkvm_populate_e820(zero_page);
+    x86_pkvm_write_gdt(is_64bit);
+    if (is_64bit) {
+        x86_pkvm_write_page_tables();
+    }
+
+    cpu_physical_memory_write(x86_pkvm_zero_page_addr, zero_page, sizeof(zero_page));
+    cpu_physical_memory_write(cmdline_addr, machine->kernel_cmdline,
+                              strlen(machine->kernel_cmdline) + 1);
+    cpu_physical_memory_write(kernel_load_addr, kernel, kernel_size);
+
+    if (pkvm_guest_uses_firmware()) {
+        if (pkvm_guest_set_fw_gpa(PKVM_FW_START, &local_err) < 0) {
+            error_report_err(local_err);
+            exit(1);
+        }
+        pkvm_guest_set_fw_boot_state(kernel_entry, dtb_addr);
+    } else {
+        pkvm_guest_set_kernel_boot_state(kernel_entry, x86_pkvm_zero_page_addr,
+                                         x86_pkvm_boot_stack_pointer,
+                                         is_64bit);
+    }
+}
 
 static void x86_cpu_new(X86MachineState *x86ms, int64_t apic_id, Error **errp)
 {
@@ -652,6 +1411,7 @@ void x86_load_linux(X86MachineState *x86ms,
     uint32_t initrd_max;
     uint8_t header[8192], *setup, *kernel;
     hwaddr real_addr, prot_addr, cmdline_addr, initrd_addr = 0;
+    uint64_t initrd_size_total = 0;
     FILE *f;
     const char *vmode;
     MachineState *machine = MACHINE(x86ms);
@@ -661,6 +1421,10 @@ void x86_load_linux(X86MachineState *x86ms,
     const char *dtb_filename = machine->dtb;
     const char *kernel_cmdline = machine->kernel_cmdline;
     SevKernelLoaderContext sev_load_ctx = {};
+    bool pkvm = pkvm_enabled();
+    hwaddr kernel_entry = 0;
+    hwaddr dtb_addr = 0;
+    bool kernel_is_64bit = false;
 
     /* Align to 16 bytes as a paranoia measure */
     cmdline_size = (strlen(kernel_cmdline) + 16) & ~15;
@@ -689,6 +1453,10 @@ void x86_load_linux(X86MachineState *x86ms,
     if (ldl_le_p(header + 0x202) == 0x53726448) /* Magic signature "HdrS" */ {
         protocol = lduw_le_p(header + 0x206);
     } else {
+        if (pkvm) {
+            error_report("pKVM direct boot requires a Linux bzImage kernel");
+            exit(1);
+        }
         /*
          * This could be a multiboot kernel. If it is, let's stop treating it
          * like a Linux kernel.
@@ -777,6 +1545,10 @@ void x86_load_linux(X86MachineState *x86ms,
         real_addr    = 0x10000;
         cmdline_addr = 0x20000;
         prot_addr    = 0x100000;
+    }
+
+    if (pkvm) {
+        prot_addr = PKVM_BZIMAGE_LOAD_ADDR;
     }
 
     /* highest address for loading the initrd */
@@ -883,6 +1655,7 @@ void x86_load_linux(X86MachineState *x86ms,
 
         initrd_data = g_mapped_file_get_contents(mapped_file);
         initrd_size = g_mapped_file_get_length(mapped_file);
+        initrd_size_total = initrd_size;
         if (initrd_size >= initrd_max) {
             fprintf(stderr, "qemu: initrd is too large, cannot support."
                     "(max: %"PRIu32", need %"PRId64")\n",
@@ -890,7 +1663,12 @@ void x86_load_linux(X86MachineState *x86ms,
             exit(1);
         }
 
-        initrd_addr = (initrd_max - initrd_size) & ~4095;
+        initrd_addr = pkvm ? x86_pkvm_initrd_addr(initrd_max, initrd_size) :
+                             ((initrd_max - initrd_size) & ~4095ULL);
+        if (initrd_addr == HWADDR_MAX) {
+            fprintf(stderr, "qemu: initrd does not fit around the pKVM firmware window\n");
+            exit(1);
+        }
 
         fw_cfg_add_i32(fw_cfg, FW_CFG_INITRD_ADDR, initrd_addr);
         fw_cfg_add_i32(fw_cfg, FW_CFG_INITRD_SIZE, initrd_size);
@@ -900,6 +1678,10 @@ void x86_load_linux(X86MachineState *x86ms,
 
         stl_le_p(header + 0x218, initrd_addr);
         stl_le_p(header + 0x21c, initrd_size);
+
+        if (pkvm) {
+            cpu_physical_memory_write(initrd_addr, initrd_data, initrd_size);
+        }
     }
 
     /* load kernel and setup */
@@ -929,6 +1711,10 @@ void x86_load_linux(X86MachineState *x86ms,
 
     /* append dtb to kernel */
     if (dtb_filename) {
+        if (pkvm && !machine->dtb) {
+            error_report("pKVM DTB handling requires a valid dtb file");
+            exit(1);
+        }
         if (protocol < 0x209) {
             fprintf(stderr, "qemu: Linux kernel too old to load a dtb\n");
             exit(1);
@@ -945,7 +1731,8 @@ void x86_load_linux(X86MachineState *x86ms,
         kernel_size = setup_data_offset + sizeof(struct setup_data) + dtb_size;
         kernel = g_realloc(kernel, kernel_size);
 
-        stq_le_p(header + 0x250, prot_addr + setup_data_offset);
+        stq_le_p(header + 0x250,
+                 (pkvm ? prot_addr - setup_size : prot_addr) + setup_data_offset);
 
         setup_data = (struct setup_data *)(kernel + setup_data_offset);
         setup_data->next = 0;
@@ -953,6 +1740,8 @@ void x86_load_linux(X86MachineState *x86ms,
         setup_data->len = cpu_to_le32(dtb_size);
 
         load_image_size(dtb_filename, setup_data->data, dtb_size);
+        dtb_addr = (prot_addr - setup_size) + setup_data_offset +
+                   sizeof(struct setup_data);
     }
 
     /*
@@ -966,18 +1755,49 @@ void x86_load_linux(X86MachineState *x86ms,
         memcpy(setup, header, MIN(sizeof(header), setup_size));
     }
 
+    sev_load_ctx.kernel_data = (char *)kernel + setup_size;
+    sev_load_ctx.kernel_size = kernel_size - setup_size;
+    sev_load_ctx.setup_data = (char *)setup;
+    sev_load_ctx.setup_size = setup_size;
+
+    kernel_is_64bit = lduw_le_p(header + 0x236) & XLF_KERNEL_64;
+
+    if (pkvm) {
+        if (pkvm_guest_is_direct_kernel_boot() && kernel_is_64bit) {
+            /*
+             * Enter 64-bit bzImage kernels through the 32-bit protected-mode
+             * entry so the guest can switch to its own page tables before any
+             * early emulation path needs to walk protected guest paging state.
+             */
+            kernel_is_64bit = false;
+        }
+        kernel_entry = prot_addr + (kernel_is_64bit ? 0x200 : 0);
+    } else if (protocol >= 0x202 && ldl_le_p(header + 0x214)) {
+        kernel_entry = ldl_le_p(header + 0x214);
+    } else {
+        kernel_entry = prot_addr;
+    }
+
+    if (pkvm) {
+        if (machine->shim_filename) {
+            error_report("pKVM direct boot does not support shim");
+            exit(1);
+        }
+        x86_load_linux_pkvm(x86ms, setup_size, setup, kernel_size,
+                            kernel, cmdline_addr,
+                            initrd_addr, initrd_filename ? initrd_size_total : 0,
+                            kernel_entry, dtb_addr, kernel_is_64bit);
+        return;
+    }
+
     fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_ADDR, prot_addr);
     fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_SIZE, kernel_size - setup_size);
     fw_cfg_add_bytes(fw_cfg, FW_CFG_KERNEL_DATA,
                      kernel + setup_size, kernel_size - setup_size);
-    sev_load_ctx.kernel_data = (char *)kernel + setup_size;
-    sev_load_ctx.kernel_size = kernel_size - setup_size;
 
     fw_cfg_add_i32(fw_cfg, FW_CFG_SETUP_ADDR, real_addr);
     fw_cfg_add_i32(fw_cfg, FW_CFG_SETUP_SIZE, setup_size);
     fw_cfg_add_bytes(fw_cfg, FW_CFG_SETUP_DATA, setup, setup_size);
-    sev_load_ctx.setup_data = (char *)setup;
-    sev_load_ctx.setup_size = setup_size;
 
     /* kernel without setup header patches */
     fw_cfg_add_file(fw_cfg, "etc/boot/kernel", kernel, kernel_size);

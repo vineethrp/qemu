@@ -36,6 +36,7 @@
 #include "hw/qdev-properties.h"
 #include "hw/block/flash.h"
 #include "system/kvm.h"
+#include "target/i386/pkvm.h"
 #include "target/i386/sev.h"
 
 #define FLASH_SECTOR_SIZE 4096
@@ -98,6 +99,10 @@ static PFlashCFI01 *pc_pflash_create(PCMachineState *pcms,
 void pc_system_flash_create(PCMachineState *pcms)
 {
     PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(pcms);
+
+    if (pkvm_guest_is_direct_kernel_boot()) {
+        return;
+    }
 
     if (pcmc->pci_enabled) {
         pcms->flash[0] = pc_pflash_create(pcms, "system.flash0",
@@ -217,6 +222,11 @@ void pc_system_firmware_init(PCMachineState *pcms,
     PCMachineClass *pcmc = PC_MACHINE_GET_CLASS(pcms);
     int i;
     BlockBackend *pflash_blk[ARRAY_SIZE(pcms->flash)];
+
+    if (pkvm_guest_is_direct_kernel_boot()) {
+        pc_system_flash_cleanup_unused(pcms);
+        return;
+    }
 
     if (!pcmc->pci_enabled) {
         x86_bios_rom_init(X86_MACHINE(pcms), "bios.bin", rom_memory, true);

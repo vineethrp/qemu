@@ -31,6 +31,7 @@
 #include "system/kvm.h"
 #include "hw/qdev-properties.h"
 #include "hw/sysbus.h"
+#include "target/i386/pkvm.h"
 #include "migration/vmstate.h"
 
 bool apic_report_tpr_access;
@@ -285,7 +286,8 @@ static void apic_common_realize(DeviceState *dev, Error **errp)
     }
 
     /* Note: We need at least 1M to map the VAPIC option ROM */
-    if (!vapic && s->vapic_control & VAPIC_ENABLE_MASK &&
+    if (!vapic && !pkvm_guest_is_direct_kernel_boot() &&
+            s->vapic_control & VAPIC_ENABLE_MASK &&
             current_machine->ram_size >= 1024 * 1024) {
         vapic = sysbus_create_simple("kvmvapic", -1, NULL);
     }
