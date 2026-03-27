@@ -186,6 +186,7 @@ void pkvm_guest_apply_boot_state(X86CPU *cpu)
 {
     PkvmGuestState *pkvm = pkvm_guest_get();
     CPUX86State *env = &cpu->env;
+    const uint64_t pkvm_mtrr_deftype = (1ULL << 11) | 6;
     uint32_t data_seg = DESC_P_MASK | DESC_S_MASK | DESC_W_MASK |
                         DESC_G_MASK | DESC_B_MASK | DESC_A_MASK;
     uint32_t code_seg_flat32 = DESC_P_MASK | DESC_S_MASK | DESC_CS_MASK |
@@ -205,7 +206,21 @@ void pkvm_guest_apply_boot_state(X86CPU *cpu)
     env->regs[R_ESP] = pkvm->boot_rsp;
     env->regs[R_EDI] = pkvm->boot_rdi;
     env->regs[R_EDX] = pkvm->boot_rdx;
+    env->eflags = 0x2;
     env->cr[2] = 0;
+    env->sysenter_cs = 0;
+    env->sysenter_esp = 0;
+    env->sysenter_eip = 0;
+    env->star = 0;
+    env->cstar = 0;
+    env->kernelgsbase = 0;
+    env->fmask = 0;
+    env->lstar = 0;
+    env->tsc = 0;
+    env->msr_ia32_misc_enable = 1;
+    if (env->features[FEAT_1_EDX] & CPUID_MTRR) {
+        env->mtrr_deftype = pkvm_mtrr_deftype;
+    }
 
     env->gdt.base = PKVM_BOOT_GDT_ADDR;
     env->gdt.limit = (pkvm->boot_mode == PKVM_BOOT_MODE_DIRECT_LONG64 ? 6 : 5) * 8 - 1;
@@ -213,16 +228,15 @@ void pkvm_guest_apply_boot_state(X86CPU *cpu)
     env->idt.limit = 8 - 1;
 
     if (pkvm->boot_mode == PKVM_BOOT_MODE_DIRECT_LONG64) {
-        cpu_load_efer(env, MSR_EFER_LME);
+        cpu_load_efer(env, MSR_EFER_LME | MSR_EFER_LMA);
         cpu_x86_update_cr3(env, PKVM_BOOT_PML4_ADDR);
         cpu_x86_update_cr4(env, CR4_PAE_MASK);
-        cpu_x86_update_cr0(env, CR0_ET_MASK | CR0_NE_MASK |
-                                CR0_PE_MASK | CR0_PG_MASK);
+        cpu_x86_update_cr0(env, CR0_PE_MASK | CR0_PG_MASK);
     } else {
         cpu_load_efer(env, 0);
         cpu_x86_update_cr3(env, 0);
         cpu_x86_update_cr4(env, 0);
-        cpu_x86_update_cr0(env, CR0_ET_MASK | CR0_NE_MASK | CR0_PE_MASK);
+        cpu_x86_update_cr0(env, CR0_PE_MASK);
     }
 
     cpu_x86_load_seg_cache(env, R_CS, 0x10, 0, 0xffffffff,

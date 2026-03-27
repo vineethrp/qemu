@@ -3414,6 +3414,55 @@ static void set_seg(struct kvm_segment *lhs, const SegmentCache *rhs)
     lhs->padding = 0;
 }
 
+static void kvm_pkvm_set_seg(struct kvm_segment *seg, uint16_t selector,
+                             uint64_t base, uint32_t limit, uint8_t type,
+                             uint8_t present, uint8_t dpl, uint8_t db,
+                             uint8_t s, uint8_t l, uint8_t g, uint8_t avl)
+{
+    seg->selector = selector;
+    seg->base = base;
+    seg->limit = limit;
+    seg->type = type;
+    seg->present = present;
+    seg->dpl = dpl;
+    seg->db = db;
+    seg->s = s;
+    seg->l = l;
+    seg->g = g;
+    seg->avl = avl;
+    seg->unusable = !present;
+    seg->padding = 0;
+}
+
+static void kvm_pkvm_set_direct_sregs(struct kvm_sregs *sregs, X86CPU *cpu)
+{
+    CPUX86State *env = &cpu->env;
+    bool long_mode = env->efer & MSR_EFER_LMA;
+
+    kvm_pkvm_set_seg(&sregs->cs, 0x10, 0, 0xffffffff, 11, 1, 0,
+                     long_mode ? 0 : 1, 1, long_mode ? 1 : 0, 1, 0);
+    kvm_pkvm_set_seg(&sregs->ds, 0x18, 0, 0xffffffff, 3, 1, 0, 1, 1, 0, 1, 0);
+    kvm_pkvm_set_seg(&sregs->es, 0x18, 0, 0xffffffff, 3, 1, 0, 1, 1, 0, 1, 0);
+    kvm_pkvm_set_seg(&sregs->fs, 0x18, 0, 0xffffffff, 3, 1, 0, 1, 1, 0, 1, 0);
+    kvm_pkvm_set_seg(&sregs->gs, 0x18, 0, 0xffffffff, 3, 1, 0, 1, 1, 0, 1, 0);
+    kvm_pkvm_set_seg(&sregs->ss, 0x18, 0, 0xffffffff, 3, 1, 0, 1, 1, 0, 1, 0);
+    kvm_pkvm_set_seg(&sregs->tr, 0x20, 0, 0xffffffff, 11, 1, 0, 0, 0, 0, 1, 0);
+    kvm_pkvm_set_seg(&sregs->ldt, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    sregs->idt.base = PKVM_BOOT_IDT_ADDR;
+    sregs->idt.limit = 8 - 1;
+    memset(sregs->idt.padding, 0, sizeof(sregs->idt.padding));
+    sregs->gdt.base = PKVM_BOOT_GDT_ADDR;
+    sregs->gdt.limit = (long_mode ? 6 : 5) * 8 - 1;
+    memset(sregs->gdt.padding, 0, sizeof(sregs->gdt.padding));
+
+    sregs->cr0 = CR0_PE_MASK | (long_mode ? CR0_PG_MASK : 0);
+    sregs->cr2 = 0;
+    sregs->cr3 = long_mode ? PKVM_BOOT_PML4_ADDR : 0;
+    sregs->cr4 = long_mode ? CR4_PAE_MASK : 0;
+    sregs->efer = long_mode ? (MSR_EFER_LME | MSR_EFER_LMA) : 0;
+}
+
 static void get_seg(SegmentCache *lhs, const struct kvm_segment *rhs)
 {
     lhs->selector = rhs->selector;
@@ -3565,6 +3614,10 @@ static int kvm_put_sregs(X86CPU *cpu)
 
     sregs.efer = env->efer;
 
+    if (pkvm && pkvm_guest_is_direct_kernel_boot() && cpu_is_bsp(cpu)) {
+        kvm_pkvm_set_direct_sregs(&sregs, cpu);
+    }
+
     return kvm_vcpu_ioctl(CPU(cpu), KVM_SET_SREGS, &sregs);
 }
 
@@ -3629,6 +3682,11 @@ static int kvm_put_sregs2(X86CPU *cpu)
             sregs.pdptrs[i] = env->pdptrs[i];
         }
         sregs.flags |= KVM_SREGS2_FLAGS_PDPTRS_VALID;
+    }
+
+    if (pkvm && pkvm_guest_is_direct_kernel_boot() && cpu_is_bsp(cpu)) {
+        kvm_pkvm_set_direct_sregs((struct kvm_sregs *)&sregs, cpu);
+        sregs.flags &= ~KVM_SREGS2_FLAGS_PDPTRS_VALID;
     }
 
     return kvm_vcpu_ioctl(CPU(cpu), KVM_SET_SREGS2, &sregs);
