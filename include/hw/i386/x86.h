@@ -26,6 +26,8 @@
 #include "hw/isa/isa.h"
 #include "qom/object.h"
 
+typedef struct AcpiBuildTables AcpiBuildTables;
+
 struct X86MachineClass {
     /*< private >*/
     MachineClass parent;
@@ -137,6 +139,9 @@ void x86_load_linux(X86MachineState *x86ms,
                     int acpi_data_size,
                     bool pvh_enabled);
 void x86_pkvm_post_acpi_init(void);
+void x86_pkvm_write_direct_acpi_tables(AcpiBuildTables *tables,
+                                       bool override_fadt);
+void x86_pkvm_share_direct_boot_low_memory(void);
 
 bool x86_machine_is_smm_enabled(const X86MachineState *x86ms);
 bool x86_machine_is_acpi_enabled(const X86MachineState *x86ms);

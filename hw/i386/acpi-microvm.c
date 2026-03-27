@@ -32,19 +32,26 @@
 #include "hw/acpi/generic_event_device.h"
 #include "hw/acpi/utils.h"
 #include "hw/acpi/erst.h"
+#include "hw/acpi/pci.h"
 #include "hw/i386/fw_cfg.h"
 #include "hw/i386/microvm.h"
+#include "hw/i386/pkvm-acpi-pm.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pcie_host.h"
+#include "hw/rtc/mc146818rtc_regs.h"
 #include "hw/usb/xhci.h"
 #include "hw/virtio/virtio-acpi.h"
 #include "hw/virtio/virtio-mmio.h"
 #include "hw/input/i8042.h"
+#include "target/i386/cpu.h"
+#include "target/i386/pkvm.h"
 
 #include "acpi-common.h"
 #include "acpi-microvm.h"
 
 #include CONFIG_DEVICES
+
+#define ACPI_IAPC_BOOT_ARCH_LEGACY_DEVICES BIT(0)
 
 static void acpi_dsdt_add_virtio(Aml *scope,
                                  MicrovmMachineState *mms)
@@ -118,13 +125,19 @@ build_dsdt_microvm(GArray *table_data, BIOSLinker *linker,
     dsdt = init_aml_allocator();
 
     sb_scope = aml_scope("_SB");
-    fw_cfg_add_acpi_dsdt(sb_scope, x86ms->fw_cfg);
-    qbus_build_aml(BUS(isabus), sb_scope);
-    build_ged_aml(sb_scope, GED_DEVICE, x86ms->acpi_dev,
-                  GED_MMIO_IRQ, AML_SYSTEM_MEMORY, GED_MMIO_BASE);
+    if (!pkvm_guest_is_direct_kernel_boot()) {
+        fw_cfg_add_acpi_dsdt(sb_scope, x86ms->fw_cfg);
+        qbus_build_aml(BUS(isabus), sb_scope);
+    }
+    if (!pkvm_guest_is_direct_kernel_boot()) {
+        build_ged_aml(sb_scope, GED_DEVICE, x86ms->acpi_dev,
+                      GED_MMIO_IRQ, AML_SYSTEM_MEMORY, GED_MMIO_BASE);
+    }
     acpi_dsdt_add_power_button(sb_scope);
     acpi_dsdt_add_virtio(sb_scope, mms);
-    acpi_dsdt_add_xhci(sb_scope, mms);
+    if (!pkvm_guest_is_direct_kernel_boot()) {
+        acpi_dsdt_add_xhci(sb_scope, mms);
+    }
     acpi_dsdt_add_pci(sb_scope, mms);
     aml_append(dsdt, sb_scope);
 
@@ -153,37 +166,8 @@ static void acpi_build_microvm(AcpiBuildTables *tables,
     GArray *table_offsets;
     GArray *tables_blob = tables->table_data;
     unsigned dsdt, xsdt;
-    AcpiFadtData pmfadt = {
-        /* ACPI 5.0: 4.1 Hardware-Reduced ACPI */
-        .rev = 5,
-        .flags = ((1 << ACPI_FADT_F_HW_REDUCED_ACPI) |
-                  (1 << ACPI_FADT_F_RESET_REG_SUP)),
-
-        /* ACPI 5.0: 4.8.3.7 Sleep Control and Status Registers */
-        .sleep_ctl = {
-            .space_id = AML_AS_SYSTEM_MEMORY,
-            .bit_width = 8,
-            .address = GED_MMIO_BASE_REGS + ACPI_GED_REG_SLEEP_CTL,
-        },
-        .sleep_sts = {
-            .space_id = AML_AS_SYSTEM_MEMORY,
-            .bit_width = 8,
-            .address = GED_MMIO_BASE_REGS + ACPI_GED_REG_SLEEP_STS,
-        },
-
-        /* ACPI 5.0: 4.8.3.6 Reset Register */
-        .reset_reg = {
-            .space_id = AML_AS_SYSTEM_MEMORY,
-            .bit_width = 8,
-            .address = GED_MMIO_BASE_REGS + ACPI_GED_REG_RESET,
-        },
-        .reset_val = ACPI_GED_RESET_VALUE,
-        /*
-         * ACPI v2, Table 5-10 - Fixed ACPI Description Table Boot Architecture
-         * Flags, bit offset 1 - 8042.
-         */
-        .iapc_boot_arch = iapc_boot_arch_8042(),
-    };
+    AcpiFadtData pmfadt = { 0 };
+    AcpiMcfgInfo mcfg = { 0 };
 
     table_offsets = g_array_new(false, true /* clear */,
                                         sizeof(uint32_t));
@@ -195,8 +179,35 @@ static void acpi_build_microvm(AcpiBuildTables *tables,
     dsdt = tables_blob->len;
     build_dsdt_microvm(tables_blob, tables->linker, mms);
 
-    pmfadt.dsdt_tbl_offset = &dsdt;
-    pmfadt.xdsdt_tbl_offset = &dsdt;
+    if (pkvm_guest_is_direct_kernel_boot()) {
+        pmfadt.rev = 6;
+        pmfadt.minor_ver = 3;
+        pmfadt.sci_int = PKVM_ACPI_SCI_IRQ;
+        pmfadt.rtc_century = RTC_CENTURY;
+        pmfadt.iapc_boot_arch = ACPI_IAPC_BOOT_ARCH_LEGACY_DEVICES |
+                                iapc_boot_arch_8042();
+        pmfadt.dsdt_tbl_offset = &dsdt;
+        pmfadt.xdsdt_tbl_offset = &dsdt;
+    } else {
+        /* ACPI 6.5: Hardware-Reduced ACPI with X_DSDT only. */
+        pmfadt.rev = 6;
+        pmfadt.minor_ver = 5;
+        pmfadt.flags = ((1 << ACPI_FADT_F_HW_REDUCED_ACPI) |
+                        (1 << ACPI_FADT_F_RESET_REG_SUP));
+        pmfadt.sleep_ctl.space_id = AML_AS_SYSTEM_MEMORY;
+        pmfadt.sleep_ctl.bit_width = 8;
+        pmfadt.sleep_ctl.address = GED_MMIO_BASE_REGS + ACPI_GED_REG_SLEEP_CTL;
+        pmfadt.sleep_sts.space_id = AML_AS_SYSTEM_MEMORY;
+        pmfadt.sleep_sts.bit_width = 8;
+        pmfadt.sleep_sts.address = GED_MMIO_BASE_REGS + ACPI_GED_REG_SLEEP_STS;
+        pmfadt.reset_reg.space_id = AML_AS_SYSTEM_MEMORY;
+        pmfadt.reset_reg.bit_width = 8;
+        pmfadt.reset_reg.address = GED_MMIO_BASE_REGS + ACPI_GED_REG_RESET;
+        pmfadt.reset_val = ACPI_GED_RESET_VALUE;
+        pmfadt.iapc_boot_arch = ACPI_IAPC_BOOT_ARCH_LEGACY_DEVICES |
+                                iapc_boot_arch_8042();
+        pmfadt.xdsdt_tbl_offset = &dsdt;
+    }
     acpi_add_table(table_offsets, tables_blob);
     build_fadt(tables_blob, tables->linker, &pmfadt, x86ms->oem_id,
                x86ms->oem_table_id);
@@ -204,6 +215,14 @@ static void acpi_build_microvm(AcpiBuildTables *tables,
     acpi_add_table(table_offsets, tables_blob);
     acpi_build_madt(tables_blob, tables->linker, X86_MACHINE(machine),
                     x86ms->oem_id, x86ms->oem_table_id);
+
+    if (mms->pcie == ON_OFF_AUTO_ON && mms->gpex.ecam.size) {
+        mcfg.base = mms->gpex.ecam.base;
+        mcfg.size = mms->gpex.ecam.size;
+        acpi_add_table(table_offsets, tables_blob);
+        build_mcfg(tables_blob, tables->linker, &mcfg, x86ms->oem_id,
+                   x86ms->oem_table_id);
+    }
 
 #ifdef CONFIG_ACPI_ERST
     {
@@ -265,4 +284,21 @@ void acpi_setup_microvm(MicrovmMachineState *mms)
                       ACPI_BUILD_RSDP_FILE);
 
     acpi_build_tables_cleanup(&tables, false);
+}
+
+void acpi_setup_microvm_direct(MicrovmMachineState *mms)
+{
+    X86MachineState *x86ms = X86_MACHINE(mms);
+    AcpiBuildTables tables;
+
+    assert(x86ms->fw_cfg);
+
+    if (!x86_machine_is_acpi_enabled(x86ms)) {
+        return;
+    }
+
+    acpi_build_tables_init(&tables);
+    acpi_build_microvm(&tables, mms);
+    x86_pkvm_write_direct_acpi_tables(&tables, true);
+    acpi_build_tables_cleanup(&tables, true);
 }

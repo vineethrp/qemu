@@ -33,6 +33,7 @@
 #include "qapi/error.h"
 #include "hw/irq.h"
 #include "hw/pci/pci_bus.h"
+#include "hw/pci/pci_host.h"
 #include "hw/pci-host/gpex.h"
 #include "hw/qdev-properties.h"
 #include "migration/vmstate.h"
@@ -208,7 +209,13 @@ static void gpex_host_class_init(ObjectClass *klass, void *data)
 static void gpex_host_initfn(Object *obj)
 {
     GPEXHost *s = GPEX_HOST(obj);
+    PCIHostState *phb = PCI_HOST_BRIDGE(obj);
     GPEXRootState *root = &s->gpex_root;
+
+    memory_region_init_io(&phb->conf_mem, obj, &pci_host_conf_le_ops, phb,
+                          "pci-conf-idx", 4);
+    memory_region_init_io(&phb->data_mem, obj, &pci_host_data_le_ops, phb,
+                          "pci-conf-data", 4);
 
     object_initialize_child(obj, "gpex_root", root, TYPE_GPEX_ROOT_DEVICE);
     qdev_prop_set_int32(DEVICE(root), "addr", PCI_DEVFN(0, 0));

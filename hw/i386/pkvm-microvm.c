@@ -40,6 +40,8 @@ static bool pkvm_microvm_is_enabled(MachineState *machine)
 static void pkvm_microvm_machine_state_init(MachineState *machine)
 {
     PkvmMicrovmMachineClass *pmc = PKVM_MICROVM_MACHINE_GET_CLASS(machine);
+    MicrovmMachineState *mms = MICROVM_MACHINE(machine);
+    X86MachineState *x86ms = X86_MACHINE(machine);
 
     if (!pkvm_microvm_is_enabled(machine)) {
         error_report("pkvm-microvm requires confidential-guest-support=pkvm-guest");
@@ -50,6 +52,18 @@ static void pkvm_microvm_machine_state_init(MachineState *machine)
         exit(1);
     }
 
+    /*
+     * Enforce the pKVM microvm defaults after property parsing and before the
+     * parent microvm init builds devices from them.
+     */
+    mms->rtc = ON_OFF_AUTO_ON;
+    mms->pcie = ON_OFF_AUTO_ON;
+    mms->ioapic2 = ON_OFF_AUTO_OFF;
+    mms->isa_serial = true;
+    mms->option_roms = false;
+    mms->auto_kernel_cmdline = true;
+    x86ms->acpi = ON_OFF_AUTO_ON;
+
     pmc->parent_init(machine);
 }
 
@@ -58,25 +72,27 @@ static void pkvm_microvm_machine_initfn(Object *obj)
     MicrovmMachineState *mms = MICROVM_MACHINE(obj);
     X86MachineState *x86ms = X86_MACHINE(obj);
 
-    mms->rtc = ON_OFF_AUTO_OFF;
-    mms->pcie = ON_OFF_AUTO_OFF;
+    mms->rtc = ON_OFF_AUTO_ON;
+    mms->pcie = ON_OFF_AUTO_ON;
     mms->ioapic2 = ON_OFF_AUTO_OFF;
     mms->isa_serial = true;
     mms->option_roms = false;
     mms->auto_kernel_cmdline = true;
 
-    x86ms->acpi = ON_OFF_AUTO_OFF;
+    x86ms->acpi = ON_OFF_AUTO_ON;
 }
 
 static void pkvm_microvm_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+    X86MachineClass *x86mc = X86_MACHINE_CLASS(oc);
     PkvmMicrovmMachineClass *pmc = PKVM_MICROVM_MACHINE_CLASS(oc);
 
     pmc->parent_init = mc->init;
     mc->init = pkvm_microvm_machine_state_init;
     mc->family = "pkvm_microvm_i386";
     mc->desc = "microvm for x86 pKVM firmwareless boot";
+    x86mc->apic_xrupt_override = true;
 }
 
 static const TypeInfo pkvm_microvm_machine_info = {

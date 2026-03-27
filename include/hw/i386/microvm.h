@@ -65,6 +65,8 @@
 #define PCIE_MMIO_SIZE        0x20000000
 #define PCIE_ECAM_BASE        0xe0000000
 #define PCIE_ECAM_SIZE        0x10000000
+#define PCIE_PIO_BASE         0x0cf8
+#define PCIE_PIO_SIZE         0x0008
 
 /* Machine type options */
 #define MICROVM_MACHINE_RTC                 "rtc"

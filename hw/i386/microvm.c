@@ -34,6 +34,7 @@
 #include "hw/irq.h"
 #include "hw/i386/kvm/clock.h"
 #include "hw/i386/microvm.h"
+#include "hw/i386/pkvm-acpi-pm.h"
 #include "hw/i386/x86.h"
 #include "target/i386/cpu.h"
 #include "target/i386/pkvm.h"
@@ -115,6 +116,7 @@ static void microvm_set_rtc(MicrovmMachineState *mms, MC146818RtcState *s)
 static void create_gpex(MicrovmMachineState *mms)
 {
     X86MachineState *x86ms = X86_MACHINE(mms);
+    PCIHostState *phb;
     MemoryRegion *mmio32_alias;
     MemoryRegion *mmio64_alias;
     MemoryRegion *mmio_reg;
@@ -125,6 +127,7 @@ static void create_gpex(MicrovmMachineState *mms)
 
     dev = qdev_new(TYPE_GPEX_HOST);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    phb = PCI_HOST_BRIDGE(dev);
 
     /* Map only the first size_ecam bytes of ECAM space */
     ecam_alias = g_new0(MemoryRegion, 1);
@@ -159,6 +162,17 @@ static void create_gpex(MicrovmMachineState *mms)
         sysbus_connect_irq(SYS_BUS_DEVICE(dev), i,
                            x86ms->gsi[mms->gpex.irq + i]);
     }
+
+    if (mms->gpex.pio.size) {
+        memory_region_add_subregion(get_system_io(),
+                                    mms->gpex.pio.base,
+                                    &phb->conf_mem);
+        memory_region_add_subregion(get_system_io(),
+                                    mms->gpex.pio.base + 4,
+                                    &phb->data_mem);
+    }
+
+    mms->gpex.bus = phb->bus;
 }
 
 static int microvm_ioapics(MicrovmMachineState *mms)
@@ -225,7 +239,9 @@ static void microvm_devices_init(MicrovmMachineState *mms)
     }
 
     /* Optional and legacy devices */
-    if (x86_machine_is_acpi_enabled(x86ms)) {
+    if (x86_machine_is_acpi_enabled(x86ms) && pkvm_guest_is_direct_kernel_boot()) {
+        pkvm_microvm_acpi_pm_init(x86ms);
+    } else if (x86_machine_is_acpi_enabled(x86ms)) {
         DeviceState *dev = qdev_new(TYPE_ACPI_GED);
         qdev_prop_set_uint32(dev, "ged-event", ACPI_GED_PWR_DOWN_EVT);
         sysbus_realize(SYS_BUS_DEVICE(dev), &error_fatal);
@@ -260,6 +276,8 @@ static void microvm_devices_init(MicrovmMachineState *mms)
         mms->gpex.mmio32.size = PCIE_MMIO_SIZE;
         mms->gpex.ecam.base   = PCIE_ECAM_BASE;
         mms->gpex.ecam.size   = PCIE_ECAM_SIZE;
+        mms->gpex.pio.base    = PCIE_PIO_BASE;
+        mms->gpex.pio.size    = PCIE_PIO_SIZE;
         mms->gpex.irq         = mms->pcie_irq_base;
         create_gpex(mms);
         x86ms->pci_irq_mask = ((1 << (mms->pcie_irq_base + 0)) |
@@ -494,17 +512,20 @@ static void microvm_machine_done(Notifier *notifier, void *data)
     X86MachineState *x86ms = X86_MACHINE(mms);
     MachineState *machine = MACHINE(mms);
 
-    acpi_setup_microvm(mms);
+    if (!pkvm_guest_is_direct_kernel_boot()) {
+        acpi_setup_microvm(mms);
+    }
     dt_setup_microvm(mms);
     fw_cfg_add_e820(x86ms->fw_cfg);
 
     if (pkvm_guest_is_direct_kernel_boot()) {
-        if (!x86_machine_is_acpi_enabled(x86ms) &&
-            mms->auto_kernel_cmdline && !mms->kernel_cmdline_fixed) {
+        if (mms->auto_kernel_cmdline && !mms->kernel_cmdline_fixed) {
             microvm_fix_kernel_cmdline(machine);
             mms->kernel_cmdline_fixed = true;
         }
+        x86_pkvm_share_direct_boot_low_memory();
         microvm_load_kernel(mms);
+        acpi_setup_microvm_direct(mms);
     }
 }
 

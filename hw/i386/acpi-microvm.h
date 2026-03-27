@@ -4,5 +4,6 @@
 #include "hw/i386/microvm.h"
 
 void acpi_setup_microvm(MicrovmMachineState *mms);
+void acpi_setup_microvm_direct(MicrovmMachineState *mms);
 
 #endif

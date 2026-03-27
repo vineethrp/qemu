@@ -35,6 +35,8 @@
 
 #include "hw/i386/x86.h"
 #include "hw/i386/acpi-build.h"
+#include "hw/i386/microvm.h"
+#include "hw/i386/pkvm-acpi-pm.h"
 #include "hw/acpi/acpi.h"
 #include "hw/acpi/piix4.h"
 #include "target/i386/cpu.h"
@@ -66,11 +68,11 @@ static const hwaddr x86_pkvm_zero_page_addr = 0x7000;
 static const hwaddr x86_pkvm_boot_stack_pointer = 0x8000;
 static const hwaddr x86_pkvm_mpf_addr = 0x0009fff0;
 static const hwaddr x86_pkvm_mptable_addr = 0x0009e800;
-static const hwaddr x86_pkvm_acpi_rsdp_addr = 0x00030000;
-static const hwaddr x86_pkvm_acpi_tables_addr = 0x00031000;
+static const hwaddr x86_pkvm_acpi_rsdp_addr = 0x000e0000;
+static const hwaddr x86_pkvm_acpi_tables_addr = 0x000e1000;
 static const hwaddr x86_pkvm_shared_low_mem_size = 0x00100000;
 
-#define X86_PKVM_ACPI_TABLES_MAX_SIZE         0x20000
+#define X86_PKVM_ACPI_TABLES_MAX_SIZE         0x1f000
 #define X86_PKVM_ICH9_PMBASE                  0xb000
 #define X86_PKVM_ACPI_RESERVED_START          x86_pkvm_acpi_rsdp_addr
 #define X86_PKVM_ACPI_RESERVED_END            (x86_pkvm_acpi_tables_addr + \
@@ -363,6 +365,9 @@ static bool x86_pkvm_acpi_get_pm_info(X86PkvmAcpiPmInfo *pm)
         pmdev = object_resolve_type_unambiguous(TYPE_ICH9_LPC_DEVICE, NULL);
     }
     if (!pmdev) {
+        pmdev = object_resolve_type_unambiguous(TYPE_PKVM_ACPI_PM, NULL);
+    }
+    if (!pmdev) {
         return false;
     }
 
@@ -420,11 +425,11 @@ static void x86_pkvm_acpi_override_fadt(X86PkvmAcpiFile *tables_file)
                                     &facs_len);
     dsdt = x86_pkvm_acpi_find_table(tables_file->blob, tables_file->len, "DSDT",
                                     &dsdt_len);
-    if (!facs || !dsdt) {
-        error_report("pkvm direct boot could not locate FACS/DSDT");
+    if (!dsdt) {
+        error_report("pkvm direct boot could not locate DSDT");
         exit(1);
     }
-    facs_addr = tables_file->addr + (facs - tables_file->blob);
+    facs_addr = facs ? tables_file->addr + (facs - tables_file->blob) : 0;
     dsdt_addr = tables_file->addr + (dsdt - tables_file->blob);
 
     stl_le_p(fadt + X86_PKVM_FADT_FIELD_FACS_ADDR32, 0);
@@ -440,14 +445,14 @@ static void x86_pkvm_acpi_override_fadt(X86PkvmAcpiFile *tables_file)
     stl_le_p(fadt + X86_PKVM_FADT_FIELD_PM1B_CONTROL_BLK_ADDR, 0);
     stl_le_p(fadt + X86_PKVM_FADT_FIELD_PM2_CONTROL_BLK_ADDR, 0);
     stl_le_p(fadt + X86_PKVM_FADT_FIELD_PM_TMR_BLK_ADDR, 0);
-    stl_le_p(fadt + X86_PKVM_FADT_FIELD_GPE0_BLK_ADDR, 0);
+    stl_le_p(fadt + X86_PKVM_FADT_FIELD_GPE0_BLK_ADDR, pm.gpe0_blk);
     stl_le_p(fadt + X86_PKVM_FADT_FIELD_GPE1_BLK_ADDR, 0);
 
     fadt[X86_PKVM_FADT_FIELD_PM1A_EVENT_BLK_LEN] = 4;
     fadt[X86_PKVM_FADT_FIELD_PM1A_CONTROL_BLK_LEN] = 2;
     fadt[X86_PKVM_FADT_FIELD_PM2_CONTROL_BLK_LEN] = 0;
     fadt[X86_PKVM_FADT_FIELD_PM_TMR_LEN] = 0;
-    fadt[X86_PKVM_FADT_FIELD_GPE0_BLK_LEN] = 0;
+    fadt[X86_PKVM_FADT_FIELD_GPE0_BLK_LEN] = pm.gpe0_blk_len;
     fadt[X86_PKVM_FADT_FIELD_GPE1_BLK_LEN] = 0;
 
     stq_le_p(fadt + X86_PKVM_FADT_FIELD_FACS_ADDR64, facs_addr);
@@ -655,10 +660,9 @@ static bool x86_pkvm_acpi_apply_linker(GArray *cmd_blob, X86PkvmAcpiFile *files,
     return true;
 }
 
-static void x86_pkvm_write_acpi_tables(void)
+void x86_pkvm_write_direct_acpi_tables(AcpiBuildTables *tables,
+                                       bool override_fadt)
 {
-    MachineState *machine = MACHINE(qdev_get_machine());
-    AcpiBuildTables tables;
     uint8_t *table_blob;
     uint8_t *rsdp_blob;
     X86PkvmAcpiFile files[] = {
@@ -672,47 +676,45 @@ static void x86_pkvm_write_acpi_tables(void)
     size_t table_len, rsdp_len;
     size_t i;
 
-    x86_pkvm_configure_ich9_lpc_pm_base();
-    acpi_build_tables_init(&tables);
-    acpi_build_direct(&tables, machine);
-
-    table_len = acpi_data_len(tables.table_data);
-    rsdp_len = acpi_data_len(tables.rsdp);
+    table_len = acpi_data_len(tables->table_data);
+    rsdp_len = acpi_data_len(tables->rsdp);
     if (table_len > X86_PKVM_ACPI_TABLES_MAX_SIZE ||
         x86_pkvm_acpi_rsdp_addr + rsdp_len > x86_pkvm_acpi_tables_addr) {
         error_report("pkvm direct boot ACPI table placement is invalid");
         exit(1);
     }
 
-    table_blob = g_memdup2(tables.table_data->data, table_len);
-    rsdp_blob = g_memdup2(tables.rsdp->data, rsdp_len);
+    table_blob = g_memdup2(tables->table_data->data, table_len);
+    rsdp_blob = g_memdup2(tables->rsdp->data, rsdp_len);
     files[0].blob = table_blob;
     files[0].len = table_len;
     files[0].addr = x86_pkvm_acpi_tables_addr;
     files[1].blob = rsdp_blob;
     files[1].len = rsdp_len;
-    if (tables.tcpalog && acpi_data_len(tables.tcpalog)) {
-        files[2].blob = g_memdup2(tables.tcpalog->data,
-                                  acpi_data_len(tables.tcpalog));
-        files[2].len = acpi_data_len(tables.tcpalog);
+    if (tables->tcpalog && acpi_data_len(tables->tcpalog)) {
+        files[2].blob = g_memdup2(tables->tcpalog->data,
+                                  acpi_data_len(tables->tcpalog));
+        files[2].len = acpi_data_len(tables->tcpalog);
     }
-    if (tables.vmgenid && acpi_data_len(tables.vmgenid)) {
-        files[3].blob = g_memdup2(tables.vmgenid->data,
-                                  acpi_data_len(tables.vmgenid));
-        files[3].len = acpi_data_len(tables.vmgenid);
+    if (tables->vmgenid && acpi_data_len(tables->vmgenid)) {
+        files[3].blob = g_memdup2(tables->vmgenid->data,
+                                  acpi_data_len(tables->vmgenid));
+        files[3].len = acpi_data_len(tables->vmgenid);
     }
-    if (tables.hardware_errors && acpi_data_len(tables.hardware_errors)) {
-        files[4].blob = g_memdup2(tables.hardware_errors->data,
-                                  acpi_data_len(tables.hardware_errors));
-        files[4].len = acpi_data_len(tables.hardware_errors);
+    if (tables->hardware_errors && acpi_data_len(tables->hardware_errors)) {
+        files[4].blob = g_memdup2(tables->hardware_errors->data,
+                                  acpi_data_len(tables->hardware_errors));
+        files[4].len = acpi_data_len(tables->hardware_errors);
     }
 
-    if (!x86_pkvm_acpi_apply_linker(tables.linker->cmd_blob, files,
+    if (!x86_pkvm_acpi_apply_linker(tables->linker->cmd_blob, files,
                                     ARRAY_SIZE(files))) {
         error_report("pkvm direct boot ACPI linker contains unsupported commands");
         exit(1);
     }
-    x86_pkvm_acpi_override_fadt(&files[0]);
+    if (override_fadt) {
+        x86_pkvm_acpi_override_fadt(&files[0]);
+    }
 
     for (i = 0; i < ARRAY_SIZE(files); i++) {
         if (files[i].blob && files[i].addr) {
@@ -726,22 +728,35 @@ static void x86_pkvm_write_acpi_tables(void)
     for (i = 0; i < ARRAY_SIZE(files); i++) {
         g_free(files[i].blob);
     }
-    acpi_build_tables_cleanup(&tables, true);
+}
+
+void x86_pkvm_share_direct_boot_low_memory(void)
+{
+    if (!kvm_enabled()) {
+        return;
+    }
+
+    if (kvm_set_memory_attributes_shared(0, x86_pkvm_shared_low_mem_size)) {
+        error_report("pKVM direct boot failed to share the guest low memory");
+        exit(1);
+    }
 }
 
 void x86_pkvm_post_acpi_init(void)
 {
+    MachineState *machine = MACHINE(qdev_get_machine());
+    AcpiBuildTables tables;
+
     if (!pkvm_enabled() || pkvm_guest_uses_firmware()) {
         return;
     }
 
-    x86_pkvm_write_acpi_tables();
-
-    if (kvm_enabled() &&
-        kvm_set_memory_attributes_shared(0, x86_pkvm_shared_low_mem_size)) {
-        error_report("pKVM direct boot failed to share the guest low memory");
-        exit(1);
-    }
+    x86_pkvm_configure_ich9_lpc_pm_base();
+    acpi_build_tables_init(&tables);
+    acpi_build_direct(&tables, machine);
+    x86_pkvm_write_direct_acpi_tables(&tables, true);
+    acpi_build_tables_cleanup(&tables, true);
+    x86_pkvm_share_direct_boot_low_memory();
 }
 
 static uint64_t x86_pkvm_gdt_entry(uint16_t flags, uint32_t base, uint32_t limit)
@@ -941,6 +956,10 @@ static void x86_pkvm_write_mptable(MachineState *machine)
 
 static void x86_pkvm_populate_e820(X86MachineState *x86ms, uint8_t *zero_page)
 {
+    MachineState *machine = MACHINE(x86ms);
+    MicrovmMachineState *mms =
+        object_dynamic_cast(OBJECT(machine), TYPE_MICROVM_MACHINE) ?
+        MICROVM_MACHINE(machine) : NULL;
     struct e820_entry *table;
     int entries, i;
 
@@ -971,6 +990,20 @@ static void x86_pkvm_populate_e820(X86MachineState *x86ms, uint8_t *zero_page)
         entry->addr = X86_PKVM_ACPI_RESERVED_START;
         entry->size = X86_PKVM_ACPI_RESERVED_END -
                       X86_PKVM_ACPI_RESERVED_START + 1;
+        entry->type = E820_RESERVED;
+        entries++;
+    }
+
+    if (pkvm_guest_is_direct_kernel_boot() && mms &&
+        mms->pcie == ON_OFF_AUTO_ON && mms->gpex.ecam.size &&
+        entries < X86_PKVM_E820_MAX_ENTRIES) {
+        struct boot_e820_entry *entry =
+            (struct boot_e820_entry *)(zero_page +
+                                       X86_PKVM_BOOTPARAM_E820_TABLE_OFFSET +
+                                       entries * sizeof(struct boot_e820_entry));
+
+        entry->addr = mms->gpex.ecam.base;
+        entry->size = mms->gpex.ecam.size;
         entry->type = E820_RESERVED;
         entries++;
     }
