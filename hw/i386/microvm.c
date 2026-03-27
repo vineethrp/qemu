@@ -58,6 +58,21 @@
 #define MICROVM_QBOOT_FILENAME "qboot.rom"
 #define MICROVM_BIOS_FILENAME  "bios-microvm.bin"
 
+static void microvm_fix_kernel_cmdline(MachineState *machine);
+
+static void microvm_load_kernel(MicrovmMachineState *mms)
+{
+    MicrovmMachineClass *mmc = MICROVM_MACHINE_GET_CLASS(mms);
+    MachineState *machine = MACHINE(mms);
+    X86MachineState *x86ms = X86_MACHINE(mms);
+
+    if (machine->kernel_filename == NULL) {
+        return;
+    }
+
+    mmc->x86_load_linux(x86ms, x86ms->fw_cfg, 0, true);
+}
+
 static void microvm_set_rtc(MicrovmMachineState *mms, MC146818RtcState *s)
 {
     X86MachineState *x86ms = X86_MACHINE(mms);
@@ -198,9 +213,15 @@ static void microvm_devices_init(MicrovmMachineState *mms)
     }
 
     for (i = 0; i < mms->virtio_num_transports; i++) {
-        sysbus_create_simple("virtio-mmio",
-                             VIRTIO_MMIO_BASE + i * 512,
-                             x86ms->gsi[mms->virtio_irq_base + i]);
+        DeviceState *dev = qdev_new(TYPE_VIRTIO_MMIO);
+
+        if (pkvm_guest_is_direct_kernel_boot()) {
+            qdev_prop_set_bit(dev, "force-legacy", false);
+        }
+        sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+        sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, VIRTIO_MMIO_BASE + i * 512);
+        sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0,
+                           x86ms->gsi[mms->virtio_irq_base + i]);
     }
 
     /* Optional and legacy devices */
@@ -276,15 +297,16 @@ static void microvm_devices_init(MicrovmMachineState *mms)
         serial_hds_isa_init(isa_bus, 0, 1);
     }
 
-    default_firmware = x86_machine_is_acpi_enabled(x86ms)
-            ? MICROVM_BIOS_FILENAME
-            : MICROVM_QBOOT_FILENAME;
-    x86_bios_rom_init(x86ms, default_firmware, get_system_memory(), true);
+    if (!pkvm_guest_is_direct_kernel_boot()) {
+        default_firmware = x86_machine_is_acpi_enabled(x86ms)
+                ? MICROVM_BIOS_FILENAME
+                : MICROVM_QBOOT_FILENAME;
+        x86_bios_rom_init(x86ms, default_firmware, get_system_memory(), true);
+    }
 }
 
 static void microvm_memory_init(MicrovmMachineState *mms)
 {
-    MicrovmMachineClass *mmc = MICROVM_MACHINE_GET_CLASS(mms);
     MachineState *machine = MACHINE(mms);
     X86MachineState *x86ms = X86_MACHINE(mms);
     MemoryRegion *ram_below_4g, *ram_above_4g;
@@ -329,8 +351,15 @@ static void microvm_memory_init(MicrovmMachineState *mms)
 
     rom_set_fw(fw_cfg);
 
-    if (machine->kernel_filename != NULL) {
-        mmc->x86_load_linux(x86ms, fw_cfg, 0, true);
+    if (!pkvm_guest_is_direct_kernel_boot() &&
+        !x86_machine_is_acpi_enabled(x86ms) &&
+        mms->auto_kernel_cmdline && !mms->kernel_cmdline_fixed) {
+        microvm_fix_kernel_cmdline(machine);
+        mms->kernel_cmdline_fixed = true;
+    }
+
+    if (!pkvm_guest_is_direct_kernel_boot()) {
+        microvm_load_kernel(mms);
     }
 
     if (mms->option_roms) {
@@ -341,6 +370,7 @@ static void microvm_memory_init(MicrovmMachineState *mms)
 
     x86ms->fw_cfg = fw_cfg;
     x86ms->ioapic_as = &address_space_memory;
+
 }
 
 static gchar *microvm_get_mmio_cmdline(gchar *name, uint32_t virtio_irq_base)
@@ -410,10 +440,15 @@ static void microvm_fix_kernel_cmdline(MachineState *machine)
         }
     }
 
-    fw_cfg_modify_i32(x86ms->fw_cfg, FW_CFG_CMDLINE_SIZE, strlen(cmdline) + 1);
-    fw_cfg_modify_string(x86ms->fw_cfg, FW_CFG_CMDLINE_DATA, cmdline);
+    g_free(machine->kernel_cmdline);
+    machine->kernel_cmdline = cmdline;
 
-    g_free(cmdline);
+    if (x86ms->fw_cfg && !pkvm_guest_is_direct_kernel_boot()) {
+        fw_cfg_modify_i32(x86ms->fw_cfg, FW_CFG_CMDLINE_SIZE,
+                          strlen(machine->kernel_cmdline) + 1);
+        fw_cfg_modify_string(x86ms->fw_cfg, FW_CFG_CMDLINE_DATA,
+                             machine->kernel_cmdline);
+    }
 }
 
 static void microvm_device_pre_plug_cb(HotplugHandler *hotplug_dev,
@@ -457,10 +492,20 @@ static void microvm_machine_done(Notifier *notifier, void *data)
     MicrovmMachineState *mms = container_of(notifier, MicrovmMachineState,
                                             machine_done);
     X86MachineState *x86ms = X86_MACHINE(mms);
+    MachineState *machine = MACHINE(mms);
 
     acpi_setup_microvm(mms);
     dt_setup_microvm(mms);
     fw_cfg_add_e820(x86ms->fw_cfg);
+
+    if (pkvm_guest_is_direct_kernel_boot()) {
+        if (!x86_machine_is_acpi_enabled(x86ms) &&
+            mms->auto_kernel_cmdline && !mms->kernel_cmdline_fixed) {
+            microvm_fix_kernel_cmdline(machine);
+            mms->kernel_cmdline_fixed = true;
+        }
+        microvm_load_kernel(mms);
+    }
 }
 
 static void microvm_powerdown_req(Notifier *notifier, void *data)
