@@ -100,6 +100,19 @@ static uint64_t kvm_supported_memory_attributes;
 static bool kvm_guest_memfd_supported;
 static hwaddr kvm_max_slot_size = ~0;
 
+static bool kvm_skip_host_discard_on_convert(void)
+{
+    MachineState *machine = current_machine;
+    Object *cgs;
+
+    if (!machine || !machine->cgs) {
+        return false;
+    }
+
+    cgs = OBJECT(machine->cgs);
+    return g_str_equal(object_get_typename(cgs), "pkvm-guest");
+}
+
 static const KVMCapabilityInfo kvm_required_capabilites[] = {
     KVM_CAP_INFO(USER_MEMORY),
     KVM_CAP_INFO(DESTROY_MEMORY_REGION_WORKS),
@@ -949,6 +962,10 @@ static void kvm_cpu_synchronize_kick_all(void)
  */
 static void kvm_dirty_ring_flush(void)
 {
+    if (!kvm_state || !kvm_state->kvm_dirty_ring_size) {
+        return;
+    }
+
     trace_kvm_dirty_ring_flush(0);
     /*
      * The function needs to be serialized.  Since this function
@@ -1775,6 +1792,10 @@ static void kvm_log_sync(MemoryListener *listener,
 {
     KVMMemoryListener *kml = container_of(listener, KVMMemoryListener, listener);
 
+    if (kvm_skip_host_discard_on_convert()) {
+        return;
+    }
+
     kvm_slots_lock();
     kvm_physical_sync_dirty_bitmap(kml, section);
     kvm_slots_unlock();
@@ -1786,6 +1807,10 @@ static void kvm_log_sync_global(MemoryListener *l, bool last_stage)
     KVMState *s = kvm_state;
     KVMSlot *mem;
     int i;
+
+    if (!s || kvm_skip_host_discard_on_convert()) {
+        return;
+    }
 
     /* Flush all kernel dirty addresses into KVMSlot dirty bitmap */
     kvm_dirty_ring_flush();
@@ -3068,6 +3093,11 @@ int kvm_convert_memory(hwaddr start, hwaddr size, bool to_private)
         ret = kvm_set_memory_attributes_shared(start, size);
     }
     if (ret) {
+        goto out_unref;
+    }
+
+    if (kvm_skip_host_discard_on_convert()) {
+        ret = 0;
         goto out_unref;
     }
 
