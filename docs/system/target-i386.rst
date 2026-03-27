@@ -17,6 +17,7 @@ Board-specific documentation
    i386/pc
    i386/microvm
    i386/nitro-enclave
+   i386/pkvm
 
 Architectural features
 ~~~~~~~~~~~~~~~~~~~~~~
