@@ -64,6 +64,8 @@
 static size_t pvh_start_addr;
 static const hwaddr x86_pkvm_zero_page_addr = 0x7000;
 static const hwaddr x86_pkvm_boot_stack_pointer = 0x8000;
+static const hwaddr x86_pkvm_mpf_addr = 0x0009fff0;
+static const hwaddr x86_pkvm_mptable_addr = 0x0009e800;
 static const hwaddr x86_pkvm_acpi_rsdp_addr = 0x00030000;
 static const hwaddr x86_pkvm_acpi_tables_addr = 0x00031000;
 static const hwaddr x86_pkvm_shared_low_mem_size = 0x00100000;
@@ -74,6 +76,9 @@ static const hwaddr x86_pkvm_shared_low_mem_size = 0x00100000;
 #define X86_PKVM_ACPI_RESERVED_END            (x86_pkvm_acpi_tables_addr + \
                                                X86_PKVM_ACPI_TABLES_MAX_SIZE - 1)
 #define X86_PKVM_BOOTPARAM_ACPI_RSDP_ADDR_OFFSET 0x070
+#define X86_PKVM_BOOTPARAM_EXT_RAMDISK_IMAGE_OFFSET 0x0c0
+#define X86_PKVM_BOOTPARAM_EXT_RAMDISK_SIZE_OFFSET  0x0c4
+#define X86_PKVM_BOOTPARAM_EXT_CMD_LINE_PTR_OFFSET  0x0c8
 #define X86_PKVM_BOOTPARAM_E820_COUNT_OFFSET   0x1e8
 #define X86_PKVM_BOOTPARAM_SENTINEL_OFFSET     0x1ef
 #define X86_PKVM_BOOTPARAM_HDR_OFFSET          0x1f1
@@ -83,6 +88,18 @@ static const hwaddr x86_pkvm_shared_low_mem_size = 0x00100000;
 #define X86_PKVM_ACPI_TABLE_HEADER_LEN         36
 #define X86_PKVM_ACPI_HEADER_LENGTH_OFFSET     4
 #define X86_PKVM_ACPI_HEADER_CHECKSUM_OFFSET   9
+#define X86_PKVM_MPTABLE_MAX_CPUS              254
+
+#define X86_PKVM_MPC_CPU_ENABLED               0x1
+#define X86_PKVM_MPC_CPU_BOOTPROCESSOR         0x2
+#define X86_PKVM_MPC_APIC_USABLE               0x1
+#define X86_PKVM_MP_IRQDIR_DEFAULT             0
+#define X86_PKVM_MP_INTSRC_TYPE_INT            0
+#define X86_PKVM_MP_LINTSRC_TYPE_EXTINT        3
+#define X86_PKVM_MP_LINTSRC_TYPE_NMI           1
+#define X86_PKVM_APIC_DEFAULT_ADDRESS          0xfee00000
+#define X86_PKVM_IOAPIC_DEFAULT_ADDRESS        0xfec00000
+#define X86_PKVM_APIC_VERSION                  0x14
 
 #define X86_PKVM_FADT_FIELD_FACS_ADDR32           36
 #define X86_PKVM_FADT_FIELD_DSDT_ADDR32           40
@@ -187,6 +204,77 @@ struct x86_pkvm_bios_linker_loader_entry {
         } wr_pointer;
         char pad[124];
     };
+} QEMU_PACKED;
+
+struct x86_pkvm_mpf_intel {
+    char signature[4];
+    uint32_t physptr;
+    uint8_t length;
+    uint8_t specification;
+    int8_t checksum;
+    uint8_t feature1;
+    uint8_t feature2;
+    uint8_t feature3;
+    uint8_t feature4;
+    uint8_t feature5;
+} QEMU_PACKED;
+
+struct x86_pkvm_mpc_table {
+    char signature[4];
+    uint16_t length;
+    uint8_t spec;
+    int8_t checksum;
+    char oem[8];
+    char productid[12];
+    uint32_t oemptr;
+    uint16_t oemsize;
+    uint16_t oemcount;
+    uint32_t lapic;
+    uint32_t reserved;
+} QEMU_PACKED;
+
+struct x86_pkvm_mpc_cpu {
+    uint8_t type;
+    uint8_t apicid;
+    uint8_t apicver;
+    uint8_t cpuflag;
+    uint32_t cpufeature;
+    uint32_t featureflag;
+    uint32_t reserved[2];
+} QEMU_PACKED;
+
+struct x86_pkvm_mpc_bus {
+    uint8_t type;
+    uint8_t busid;
+    char bustype[6];
+} QEMU_PACKED;
+
+struct x86_pkvm_mpc_ioapic {
+    uint8_t type;
+    uint8_t apicid;
+    uint8_t apicver;
+    uint8_t flags;
+    uint32_t apicaddr;
+} QEMU_PACKED;
+
+struct x86_pkvm_mpc_intsrc {
+    uint8_t type;
+    uint8_t irqtype;
+    uint16_t irqflag;
+    uint8_t srcbus;
+    uint8_t srcbusirq;
+    uint8_t dstapic;
+    uint8_t dstirq;
+} QEMU_PACKED;
+
+struct x86_pkvm_mpc_lintsrc {
+    uint8_t type;
+    uint8_t irqtype;
+    uint16_t irqflag;
+    uint8_t srcbusid;
+    uint8_t srcbusirq;
+    uint8_t destapic;
+    uint8_t destapiclint;
 } QEMU_PACKED;
 
 enum {
@@ -705,7 +793,153 @@ static void x86_pkvm_write_page_tables(void)
     cpu_physical_memory_write(PKVM_BOOT_PDPTE_ADDR, pdpte, sizeof(pdpte));
 }
 
-static void x86_pkvm_populate_e820(uint8_t *zero_page)
+static uint8_t x86_pkvm_checksum(const void *buf, size_t size)
+{
+    const uint8_t *p = buf;
+    uint8_t sum = 0;
+    size_t i;
+
+    for (i = 0; i < size; i++) {
+        sum = sum + p[i];
+    }
+
+    return sum;
+}
+
+static void x86_pkvm_write_mptable(MachineState *machine)
+{
+    struct x86_pkvm_mpf_intel mpf = {
+        .signature = { '_', 'M', 'P', '_' },
+        .physptr = x86_pkvm_mptable_addr,
+        .length = 1,
+        .specification = 4,
+    };
+    struct x86_pkvm_mpc_table table = {
+        .signature = { 'P', 'C', 'M', 'P' },
+        .spec = 4,
+        .lapic = X86_PKVM_APIC_DEFAULT_ADDRESS,
+    };
+    const char bus_type_isa[6] = { 'I', 'S', 'A', ' ', ' ', ' ' };
+    const char mpc_oem[8] = { 'Q', 'E', 'M', 'U', ' ', ' ', ' ', ' ' };
+    const char mpc_product_id[12] = {
+        'p', 'K', 'V', 'M', '-', 'x', '8', '6', '-', 'Q', 'E', 'M'
+    };
+    hwaddr addr = x86_pkvm_mptable_addr + sizeof(table);
+    uint8_t checksum = 0;
+    uint16_t length;
+    uint8_t cpus = machine->smp.cpus;
+    uint8_t ioapic_id;
+    int i;
+
+    if (cpus < 1) {
+        cpus = 1;
+    }
+    if (cpus > X86_PKVM_MPTABLE_MAX_CPUS) {
+        cpus = X86_PKVM_MPTABLE_MAX_CPUS;
+    }
+    ioapic_id = cpus + 1;
+
+    memcpy(table.oem, mpc_oem, sizeof(mpc_oem));
+    memcpy(table.productid, mpc_product_id, sizeof(mpc_product_id));
+
+    for (i = 0; i < cpus; i++) {
+        struct x86_pkvm_mpc_cpu cpu = {
+            .type = 0,
+            .apicid = i,
+            .apicver = X86_PKVM_APIC_VERSION,
+            .cpuflag = X86_PKVM_MPC_CPU_ENABLED |
+                       (i == 0 ? X86_PKVM_MPC_CPU_BOOTPROCESSOR : 0),
+            .cpufeature = 0x600,
+            .featureflag = 0x201,
+        };
+
+        cpu_physical_memory_write(addr, &cpu, sizeof(cpu));
+        checksum += x86_pkvm_checksum(&cpu, sizeof(cpu));
+        addr += sizeof(cpu);
+    }
+
+    {
+        struct x86_pkvm_mpc_bus bus = {
+            .type = 1,
+            .busid = 0,
+        };
+
+        memcpy(bus.bustype, bus_type_isa, sizeof(bus_type_isa));
+        cpu_physical_memory_write(addr, &bus, sizeof(bus));
+        checksum += x86_pkvm_checksum(&bus, sizeof(bus));
+        addr += sizeof(bus);
+    }
+
+    {
+        struct x86_pkvm_mpc_ioapic ioapic = {
+            .type = 2,
+            .apicid = ioapic_id,
+            .apicver = X86_PKVM_APIC_VERSION,
+            .flags = X86_PKVM_MPC_APIC_USABLE,
+            .apicaddr = X86_PKVM_IOAPIC_DEFAULT_ADDRESS,
+        };
+
+        cpu_physical_memory_write(addr, &ioapic, sizeof(ioapic));
+        checksum += x86_pkvm_checksum(&ioapic, sizeof(ioapic));
+        addr += sizeof(ioapic);
+    }
+
+    for (i = 0; i < 16; i++) {
+        struct x86_pkvm_mpc_intsrc intsrc = {
+            .type = 3,
+            .irqtype = X86_PKVM_MP_INTSRC_TYPE_INT,
+            .irqflag = X86_PKVM_MP_IRQDIR_DEFAULT,
+            .srcbus = 0,
+            .srcbusirq = i,
+            .dstapic = ioapic_id,
+            .dstirq = i,
+        };
+
+        if (i == 0) {
+            intsrc.dstirq = 2;
+        } else if (i == 2) {
+            continue;
+        }
+
+        cpu_physical_memory_write(addr, &intsrc, sizeof(intsrc));
+        checksum += x86_pkvm_checksum(&intsrc, sizeof(intsrc));
+        addr += sizeof(intsrc);
+    }
+
+    {
+        struct x86_pkvm_mpc_lintsrc lintsrc = {
+            .type = 4,
+            .irqtype = X86_PKVM_MP_LINTSRC_TYPE_EXTINT,
+            .irqflag = X86_PKVM_MP_IRQDIR_DEFAULT,
+            .srcbusid = 0,
+            .srcbusirq = 0,
+            .destapic = 0,
+            .destapiclint = 0,
+        };
+
+        cpu_physical_memory_write(addr, &lintsrc, sizeof(lintsrc));
+        checksum += x86_pkvm_checksum(&lintsrc, sizeof(lintsrc));
+        addr += sizeof(lintsrc);
+
+        lintsrc.irqtype = X86_PKVM_MP_LINTSRC_TYPE_NMI;
+        lintsrc.destapic = 0xff;
+        lintsrc.destapiclint = 1;
+        cpu_physical_memory_write(addr, &lintsrc, sizeof(lintsrc));
+        checksum += x86_pkvm_checksum(&lintsrc, sizeof(lintsrc));
+        addr += sizeof(lintsrc);
+    }
+
+    length = addr - x86_pkvm_mptable_addr;
+    table.length = length;
+    checksum += x86_pkvm_checksum(&table, sizeof(table));
+    table.checksum = 0 - checksum;
+    cpu_physical_memory_write(x86_pkvm_mptable_addr, &table, sizeof(table));
+
+    mpf.checksum = 0 - x86_pkvm_checksum(&mpf, sizeof(mpf));
+    cpu_physical_memory_write(x86_pkvm_mpf_addr, &mpf, sizeof(mpf));
+}
+
+static void x86_pkvm_populate_e820(X86MachineState *x86ms, uint8_t *zero_page)
 {
     struct e820_entry *table;
     int entries, i;
@@ -727,6 +961,7 @@ static void x86_pkvm_populate_e820(uint8_t *zero_page)
     }
 
     if (pkvm_guest_is_direct_kernel_boot() &&
+        x86_machine_is_acpi_enabled(x86ms) &&
         entries < X86_PKVM_E820_MAX_ENTRIES) {
         struct boot_e820_entry *entry =
             (struct boot_e820_entry *)(zero_page +
@@ -773,23 +1008,41 @@ static void x86_load_linux_pkvm(X86MachineState *x86ms,
     uint8_t zero_page[4096] = {};
     struct x86_pkvm_setup_header *hdr;
     hwaddr kernel_load_addr = PKVM_BZIMAGE_LOAD_ADDR - setup_size;
+    size_t hdr_copy_len;
+    size_t hdr_end;
     Error *local_err = NULL;
 
-    memcpy(zero_page, setup, MIN(sizeof(zero_page), (size_t)setup_size));
     hdr = (struct x86_pkvm_setup_header *)(zero_page + X86_PKVM_BOOTPARAM_HDR_OFFSET);
+    hdr_end = (setup_size > 0x201) ? (0x202 + setup[0x201]) : X86_PKVM_BOOTPARAM_HDR_OFFSET;
+    hdr_end = MIN(hdr_end, (size_t)setup_size);
+    hdr_copy_len = hdr_end > X86_PKVM_BOOTPARAM_HDR_OFFSET ?
+                   MIN(sizeof(*hdr), hdr_end - X86_PKVM_BOOTPARAM_HDR_OFFSET) : 0;
+    if (hdr_copy_len) {
+        memcpy(hdr, setup + X86_PKVM_BOOTPARAM_HDR_OFFSET, hdr_copy_len);
+    }
+
     hdr->type_of_loader = 0xff;
     hdr->boot_flag = 0xaa55;
     hdr->header = 0x53726448;
     hdr->cmd_line_ptr = cmdline_addr;
     hdr->kernel_alignment = 0x1000000;
+    stl_le_p(zero_page + X86_PKVM_BOOTPARAM_EXT_CMD_LINE_PTR_OFFSET,
+             cmdline_addr >> 32);
     zero_page[X86_PKVM_BOOTPARAM_SENTINEL_OFFSET] = 0;
     if (initrd_size) {
         hdr->ramdisk_image = initrd_addr;
         hdr->ramdisk_size = initrd_size;
+        stl_le_p(zero_page + X86_PKVM_BOOTPARAM_EXT_RAMDISK_IMAGE_OFFSET,
+                 initrd_addr >> 32);
+        stl_le_p(zero_page + X86_PKVM_BOOTPARAM_EXT_RAMDISK_SIZE_OFFSET, 0);
+    }
+    if (dtb_addr) {
+        hdr->setup_data = dtb_addr - sizeof(struct setup_data);
     }
 
-    x86_pkvm_populate_e820(zero_page);
+    x86_pkvm_populate_e820(x86ms, zero_page);
     x86_pkvm_write_gdt(is_64bit);
+    x86_pkvm_write_mptable(machine);
     if (is_64bit) {
         x86_pkvm_write_page_tables();
     }
@@ -1763,14 +2016,6 @@ void x86_load_linux(X86MachineState *x86ms,
     kernel_is_64bit = lduw_le_p(header + 0x236) & XLF_KERNEL_64;
 
     if (pkvm) {
-        if (pkvm_guest_is_direct_kernel_boot() && kernel_is_64bit) {
-            /*
-             * Enter 64-bit bzImage kernels through the 32-bit protected-mode
-             * entry so the guest can switch to its own page tables before any
-             * early emulation path needs to walk protected guest paging state.
-             */
-            kernel_is_64bit = false;
-        }
         kernel_entry = prot_addr + (kernel_is_64bit ? 0x200 : 0);
     } else if (protocol >= 0x202 && ldl_le_p(header + 0x214)) {
         kernel_entry = ldl_le_p(header + 0x214);
