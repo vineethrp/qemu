@@ -341,6 +341,10 @@ static void microvm_memory_init(MicrovmMachineState *mms)
         x86ms->below_4g_mem_size = machine->ram_size;
     }
 
+    if (pkvm_enabled()) {
+        memory_region_set_unmergeable(machine->ram, true);
+    }
+
     ram_below_4g = g_malloc(sizeof(*ram_below_4g));
     memory_region_init_alias(ram_below_4g, NULL, "ram-below-4g", machine->ram,
                              0, x86ms->below_4g_mem_size);

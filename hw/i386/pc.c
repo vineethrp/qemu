@@ -889,6 +889,10 @@ void pc_memory_init(PCMachineState *pcms,
      * Split single memory region and use aliases to address portions of it,
      * done for backwards compatibility with older qemus.
      */
+    if (pkvm_enabled()) {
+        memory_region_set_unmergeable(machine->ram, true);
+    }
+
     if (pkvm_guest_hole_enabled()) {
         hwaddr below_before = MIN((hwaddr)x86ms->below_4g_mem_size,
                                   (hwaddr)PKVM_FW_START);
@@ -916,6 +920,7 @@ void pc_memory_init(PCMachineState *pcms,
 
         memory_region_init_ram(&x86ms->pkvm_fw_mem, NULL, "pkvm.fw",
                                PKVM_FW_MAX_SIZE, &error_fatal);
+        memory_region_set_unmergeable(&x86ms->pkvm_fw_mem, true);
         memory_region_add_subregion(system_memory, PKVM_FW_START,
                                     &x86ms->pkvm_fw_mem);
         e820_add_entry(PKVM_FW_START, PKVM_FW_MAX_SIZE, E820_RESERVED);
@@ -927,6 +932,7 @@ void pc_memory_init(PCMachineState *pcms,
         if (shared_low_size) {
             memory_region_init_ram(&x86ms->pkvm_low_mem, NULL, "pkvm.lowmem",
                                    shared_low_size, &error_fatal);
+            memory_region_set_unmergeable(&x86ms->pkvm_low_mem, true);
             memory_region_add_subregion(system_memory, 0,
                                         &x86ms->pkvm_low_mem);
         }

@@ -35,6 +35,7 @@
 #include "hw/virtio/virtio-pci.h"
 #include "hw/virtio/virtio-net.h"
 #include "hw/virtio/virtio-iommu.h"
+#include "system/hostmem.h"
 #include "audio/audio.h"
 
 GlobalProperty hw_compat_9_2[] = {
@@ -1667,6 +1668,10 @@ void machine_run_board_init(MachineState *machine, const char *mem_path, Error *
          * areas.
          */
         machine_set_mem_merge(OBJECT(machine), false, &error_abort);
+        if (machine->memdev) {
+            object_property_set_bool(OBJECT(machine->memdev), "merge",
+                                     false, &error_abort);
+        }
 
         /*
          * Virtio devices can't count on directly accessing guest
